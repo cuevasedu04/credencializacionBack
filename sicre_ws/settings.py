@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,12 +21,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-h!g0k_!j7y#9e6a+9-iw&lgmtyb#klr4vpdu3hmq_odnk5j!8r'
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-h!g0k_!j7y#9e6a+9-iw&lgmtyb#klr4vpdu3hmq_odnk5j!8r')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '168.231.73.222,localhost,127.0.0.1').split(',')
 
 
 # Application definition
@@ -79,11 +80,11 @@ WSGI_APPLICATION = 'sicre_ws.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'sicre_db',  
-        'USER': 'eduardo',             
-        'PASSWORD': '4n4m@2025',  
-        'HOST': '168.231.73.222',
-        'PORT': '3306',
+        'NAME': os.environ.get('DB_NAME', 'sicre_db'),
+        'USER': os.environ.get('DB_USER', 'eduardo'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', '4n4m@2025'),
+        'HOST': os.environ.get('DB_HOST', '168.231.73.222'),
+        'PORT': os.environ.get('DB_PORT', '3306'),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
@@ -126,6 +127,16 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
-# Configuración CORS: Permitir todo (para desarrollo)
-CORS_ALLOW_ALL_ORIGINS = True
+# Configuración CORS
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
+else:
+    CORS_ALLOWED_ORIGINS = os.environ.get(
+        'CORS_ALLOWED_ORIGINS',
+        'http://168.231.73.222,https://168.231.73.222'
+    ).split(',')
+
+# Default primary key field type
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
