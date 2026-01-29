@@ -79,10 +79,10 @@ WSGI_APPLICATION = 'sicre_ws.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'sicre',  
-        'USER': 'root',             
-        'PASSWORD': 'patito23',  
-        'HOST': 'localhost',
+        'NAME': 'sicre_db',  
+        'USER': 'eduardo',             
+        'PASSWORD': '4n4m@2025',  
+        'HOST': '168.231.73.222',
         'PORT': '3306',
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",

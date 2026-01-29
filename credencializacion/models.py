@@ -18,17 +18,21 @@ class Enrolamiento(models.Model):
     foto = models.BinaryField(blank=True, null=True)
     firma = models.BinaryField(blank=True, null=True)
     
+    folio = models.CharField(max_length=50, blank=True, null=True)
+    impreso = models.IntegerField(blank=True, null=True)
+    fecha_expedicion = models.DateField(blank=True, null=True)
     estatus_sincronizacion = models.IntegerField(blank=True, null=True)
     id_usuario_registra = models.IntegerField(blank=True, null=True)
     fecha_registro = models.DateTimeField(auto_now_add=True, blank=True, null=True)
+    fecha_enrolamiento = models.DateTimeField(blank=True, null=True)
     id_usuario_modifica = models.IntegerField(blank=True, null=True)
     fecha_modificacion = models.DateTimeField(blank=True, null=True)
     ultima_carga = models.DateTimeField(auto_now=True, blank=True, null=True)
     activo = models.IntegerField(blank=True, null=True)
 
     class Meta:
-        managed = False
-        db_table = 'enrolamiento'
+        managed = True
+        db_table = 'sicre_tbl_enrolamiento'
         verbose_name = 'Expediente'
         verbose_name_plural = 'Expedientes de Enrolamiento'
 
@@ -53,7 +57,7 @@ class SicreTblSig(models.Model):
     foto = models.BinaryField(blank=True, null=True)
 
     class Meta:
-        managed = False
+        managed = True
         db_table = 'sicre_tbl_sig'
         verbose_name = 'SICRE-sig'
         verbose_name_plural = 'SICRE-SIG'

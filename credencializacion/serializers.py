@@ -3,6 +3,33 @@ from .models import Enrolamiento, SicreTblSig
 import base64
 import binascii
 
+
+def detectar_tipo_imagen(data):
+    """
+    Detecta el tipo de imagen leyendo los magic bytes (primeros bytes del archivo).
+    """
+    if not data or len(data) < 12:
+        return 'jpeg'
+    
+    # PNG: 89 50 4E 47
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    # JPEG: FF D8 FF
+    elif data[:3] == b'\xff\xd8\xff':
+        return 'jpeg'
+    # GIF: 47 49 46
+    elif data[:3] == b'GIF':
+        return 'gif'
+    # WebP: 52 49 46 46 ... 57 45 42 50
+    elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    # BMP: 42 4D
+    elif data[:2] == b'BM':
+        return 'bmp'
+    else:
+        return 'jpeg'  # Default
+
+
 class Base64BinaryField(serializers.Field):
     """
     Este campo personalizado recibe un string Base64 del Frontend,
@@ -13,7 +40,12 @@ class Base64BinaryField(serializers.Field):
         if not value:
             return None
         try:
-            return base64.b64encode(value).decode('utf-8')
+            # Detectar el tipo de imagen
+            image_type = detectar_tipo_imagen(value)
+            
+            # Convertir a base64 con el prefijo correcto
+            base64_str = base64.b64encode(value).decode('utf-8')
+            return f"data:image/{image_type};base64,{base64_str}"
         except Exception:
             return None
 
@@ -56,6 +88,9 @@ class SigSerializer(serializers.ModelSerializer):
     class Meta:
         model = SicreTblSig
         fields = '__all__'
+
+class ArchivoExcelSerializer(serializers.Serializer):
+    archivo = serializers.FileField()
 
 class LoginSerializer(serializers.Serializer):
         email = serializers.EmailField()
