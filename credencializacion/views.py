@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from .models import Enrolamiento, SicreTblSig
 from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer
 from django.db.models import Q
+from django.db import models
 from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
@@ -632,6 +633,17 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                     }, status=status.HTTP_400_BAD_REQUEST)
 
                 # --- ESCENARIO B: TODO LIMPIO (INSERTAR EN AMBAS TABLAS) ---
+                from datetime import datetime
+                
+                # Obtener el lote máximo actual y calcular el siguiente
+                lote_maximo = SicreTblSig.objects.filter(lote__isnull=False).order_by('-lote').first()
+                if lote_maximo and lote_maximo.lote:
+                    siguiente_numero = int(lote_maximo.lote) + 1
+                else:
+                    siguiente_numero = 1
+                siguiente_lote = str(siguiente_numero).zfill(3)  # Formato 001, 002, 003...
+                fecha_carga_actual = datetime.now()
+                
                 sig_objs = []
                 enrolamiento_objs = []
 
@@ -665,7 +677,9 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                         inicio_vig=inicio_vig,
                         fin_vig=fin_vig,
                         eladia=row.get('eladia'),
-                        foto=foto_bytes
+                        foto=foto_bytes,
+                        lote=siguiente_lote,
+                        fecha_carga=fecha_carga_actual
                     )
                     sig_objs.append(sig)
 
@@ -697,7 +711,9 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                     "status": "success",
                     "mensaje": "Carga de registros exitosa",
                     "resumen": {
-                        "total_procesados": len(enrolamiento_objs)
+                        "total_procesados": len(enrolamiento_objs),
+                        "folio_lote": siguiente_lote,
+                        "fecha_carga": fecha_carga_actual
                     }
                 }, status=status.HTTP_201_CREATED)
 
@@ -705,6 +721,93 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                 return Response({"error": "Error interno: " + str(e)}, status=status.HTTP_400_BAD_REQUEST)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=False, methods=['get'], url_path='historial-cargas')
+    def historial_cargas(self, request):
+        """
+        Retorna un resumen de todas las cargas masivas realizadas.
+        Incluye: lote, fecha_carga, total_registros, y nombres de los primeros 10 registros.
+        """
+        from django.db.models import Count, Min
+        
+        try:
+            # Obtener todos los lotes distintos con información agregada
+            lotes = SicreTblSig.objects.values('lote', 'fecha_carga').annotate(
+                total_registros=Count('rfc'),
+                primera_carga=Min('fecha_carga')
+            ).filter(lote__isnull=False).order_by('-lote')
+            
+            resultado = []
+            for lote_info in lotes:
+                lote_num = lote_info['lote']
+                
+                # Obtener los primeros 10 registros de este lote
+                primeros_10 = SicreTblSig.objects.filter(lote=lote_num).values(
+                    'nombre', 'paterno', 'materno'
+                )[:10]
+                
+                # Construir nombres completos
+                nombres_preview = [
+                    f"{r['nombre']} {r['paterno']} {r['materno'] or ''}".strip()
+                    for r in primeros_10
+                ]
+                
+                resultado.append({
+                    'lote': lote_num,
+                    'fecha_carga': lote_info['primera_carga'],
+                    'total_registros': lote_info['total_registros'],
+                    'preview_nombres': nombres_preview
+                })
+            
+            return Response({
+                'status': 'success',
+                'total_cargas': len(resultado),
+                'cargas': resultado
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'mensaje': f'Error al obtener historial: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['get'], url_path='detalle-lote/(?P<lote_id>[0-9]+)')
+    def detalle_lote(self, request, lote_id=None):
+        """
+        Retorna todos los registros de un lote específico.
+        Parámetro: lote_id (entero) - Número de lote a consultar
+        """
+        try:
+            # Validar que el lote existe
+            if not SicreTblSig.objects.filter(lote=lote_id).exists():
+                return Response({
+                    'status': 'error',
+                    'mensaje': f'El lote {lote_id} no existe'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Obtener todos los registros del lote
+            registros = SicreTblSig.objects.filter(lote=lote_id).order_by('rfc')
+            serializer = SigSerializer(registros, many=True)
+            
+            # Información del lote
+            info_lote = SicreTblSig.objects.filter(lote=lote_id).aggregate(
+                total_registros=Count('rfc'),
+                fecha_carga=Min('fecha_carga')
+            )
+            
+            return Response({
+                'status': 'success',
+                'lote': int(lote_id),
+                'fecha_carga': info_lote['fecha_carga'],
+                'total_registros': info_lote['total_registros'],
+                'registros': serializer.data
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'mensaje': f'Error al obtener detalle del lote: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class CustomLoginView(APIView):

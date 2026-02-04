@@ -21,7 +21,7 @@ class Enrolamiento(models.Model):
     folio = models.CharField(max_length=50, blank=True, null=True)
     impreso = models.IntegerField(blank=True, null=True)
     fecha_expedicion = models.DateField(blank=True, null=True)
-    estatus_sincronizacion = models.IntegerField(blank=True, null=True)
+    provisional = models.IntegerField(db_column='provisional', blank=True, null=True)
     id_usuario_registra = models.IntegerField(blank=True, null=True)
     fecha_registro = models.DateTimeField(auto_now_add=True, blank=True, null=True)
     fecha_enrolamiento = models.DateTimeField(blank=True, null=True)
@@ -55,6 +55,8 @@ class SicreTblSig(models.Model):
     fin_vig = models.DateField(blank=True, null=True)
     eladia = models.CharField(max_length=20, blank=True, null=True)
     foto = models.BinaryField(blank=True, null=True)
+    lote = models.CharField(max_length=50, blank=True, null=True)
+    fecha_carga = models.DateTimeField(blank=True, null=True)
 
     class Meta:
         managed = True
