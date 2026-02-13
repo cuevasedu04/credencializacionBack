@@ -26,6 +26,8 @@ def extraer_imagenes_de_excel(archivo):
     from openpyxl import load_workbook
     from io import BytesIO
     import zipfile
+    import posixpath
+    import xml.etree.ElementTree as ET
     
     print(f"--- INICIANDO EXTRACCIÓN DUAL: {archivo} ---")
     fotos_por_fila = {}
@@ -73,45 +75,172 @@ def extraer_imagenes_de_excel(archivo):
     except Exception as e:
         print(f"   -> Falló método estándar: {e}")
 
-    # --- INTENTO 2: PLAN DE EMERGENCIA (ZIP) ---
-    # Si el método estándar falló y no detectó NADA, entramos al ZIP
+    # --- INTENTO 2: PLAN B ROBUSTO (ZIP + DRAWING RELS) ---
+    # Si el método estándar falló y no detectó NADA, resolvemos anclas reales
+    # desde drawing.xml y sus relaciones (NO por orden alfabético de archivos).
     if not fotos_por_fila and not firmas_por_fila:
-        print("⚠️ ACTIVANDO EXTRACCIÓN FORZADA DUAL (PLAN B ZIP)")
+        print("⚠️ ACTIVANDO EXTRACCIÓN ROBUSTA DUAL (PLAN B ZIP + RELS)")
         try:
             if hasattr(archivo, 'seek'): archivo.seek(0)
             if zipfile.is_zipfile(archivo):
                 with zipfile.ZipFile(archivo, 'r') as z:
-                    # Buscamos archivos en la carpeta media del excel
-                    media_files = [f for f in z.namelist() if 'xl/media' in f]
-                    media_files.sort() # Ordenar alfabéticamente (image1, image2, etc.)
-                    
-                    print(f"   -> Encontrados en ZIP: {len(media_files)} archivos")
-                    
-                    # ASUNCIÓN CRÍTICA DEL PLAN B:
-                    # Asumimos que vienen en pares ordenados: [Foto, Firma, Foto, Firma...]
-                    # image1.jpeg -> Fila 2 Foto
-                    # image2.png  -> Fila 2 Firma
-                    # image3.jpeg -> Fila 3 Foto...
-                    
-                    for i, media_path in enumerate(media_files):
-                        img_bytes = z.read(media_path)
-                        
-                        # Cálculo matemático de la fila
-                        # Cada 2 imágenes avanzamos 1 fila
-                        fila_actual = (i // 2) + 2
-                        
-                        # Si 'i' es PAR (0, 2, 4...) -> Es FOTO
-                        if i % 2 == 0:
-                            fotos_por_fila[fila_actual] = img_bytes
-                            print(f"   -> [ZIP] {media_path} es FOTO de Fila {fila_actual}")
-                        
-                        # Si 'i' es IMPAR (1, 3, 5...) -> Es FIRMA
+                    ns_main = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+                    ns_rel = {'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+                    ns_pkg_rel = {'pr': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+                    ns_draw = {
+                        'xdr': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing',
+                        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+                        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+                    }
+
+                    def _norm_zip_path(base_dir, target):
+                        # target puede venir absoluto (/xl/...) o relativo (../drawings/...)
+                        if target.startswith('/'):
+                            target = target[1:]
                         else:
-                            firmas_por_fila[fila_actual] = img_bytes
-                            print(f"   -> [ZIP] {media_path} es FIRMA de Fila {fila_actual}")
+                            target = posixpath.normpath(posixpath.join(base_dir, target))
+                        return target
+
+                    # 1) Localizar worksheet activo real a partir de workbook.xml
+                    wb_root = ET.fromstring(z.read('xl/workbook.xml'))
+                    sheets = wb_root.find('m:sheets', ns_main)
+                    first_sheet = sheets.find('m:sheet', ns_main) if sheets is not None else None
+                    if first_sheet is None:
+                        raise ValueError('No se encontró ninguna hoja en workbook.xml')
+                    sheet_rid = first_sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+
+                    wb_rels_root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+                    rel_node = None
+                    for rel in wb_rels_root.findall('pr:Relationship', ns_pkg_rel):
+                        if rel.attrib.get('Id') == sheet_rid:
+                            rel_node = rel
+                            break
+                    if rel_node is None:
+                        raise ValueError('No se pudo resolver la relación de la hoja activa')
+
+                    sheet_path = _norm_zip_path('xl', rel_node.attrib.get('Target', ''))
+                    sheet_dir = posixpath.dirname(sheet_path)
+
+                    # 2) Leer drawing r:id desde la hoja activa
+                    sheet_root = ET.fromstring(z.read(sheet_path))
+                    drawing_tag = sheet_root.find('m:drawing', {**ns_main, **ns_rel})
+                    if drawing_tag is None:
+                        print('   -> La hoja activa no tiene drawing asociado')
+                    else:
+                        drawing_rid = drawing_tag.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+
+                        # 3) Resolver drawing.xml desde sheet rels
+                        sheet_rels_path = posixpath.join(sheet_dir, '_rels', posixpath.basename(sheet_path) + '.rels')
+                        sheet_rels_root = ET.fromstring(z.read(sheet_rels_path))
+
+                        drawing_rel = None
+                        for rel in sheet_rels_root.findall('pr:Relationship', ns_pkg_rel):
+                            if rel.attrib.get('Id') == drawing_rid:
+                                drawing_rel = rel
+                                break
+
+                        if drawing_rel is None:
+                            print('   -> No se encontró relación al drawing en la hoja activa')
+                        else:
+                            drawing_path = _norm_zip_path(sheet_dir, drawing_rel.attrib.get('Target', ''))
+                            drawing_dir = posixpath.dirname(drawing_path)
+                            drawing_rels_path = posixpath.join(drawing_dir, '_rels', posixpath.basename(drawing_path) + '.rels')
+
+                            # 4) Mapa rId -> target_path (más tolerante)
+                            drawing_rels_root = ET.fromstring(z.read(drawing_rels_path))
+                            media_by_rid = {}
+                            for rel in drawing_rels_root.findall('pr:Relationship', ns_pkg_rel):
+                                rel_id = rel.attrib.get('Id')
+                                target = rel.attrib.get('Target', '')
+                                if rel_id and target:
+                                    media_by_rid[rel_id] = _norm_zip_path(drawing_dir, target)
+
+                            print(f"   -> Relaciones en drawing: {len(media_by_rid)}")
+
+                            # 5) Recorrer anchors con posición real y resolver bytes
+                            drawing_root = ET.fromstring(z.read(drawing_path))
+                            anchors = (
+                                drawing_root.findall('.//xdr:twoCellAnchor', ns_draw)
+                                + drawing_root.findall('.//xdr:oneCellAnchor', ns_draw)
+                                + drawing_root.findall('.//xdr:absoluteAnchor', ns_draw)
+                            )
+                            print(f"   -> Anchors detectados en drawing: {len(anchors)}")
+
+                            # Guardamos candidatos para asignar por fila/posición horizontal
+                            candidates = []
+
+                            for anchor in anchors:
+                                from_node = anchor.find('xdr:from', ns_draw)
+                                pic_node = anchor.find('.//xdr:pic', ns_draw)
+                                if from_node is None or pic_node is None:
+                                    continue
+
+                                col_node = from_node.find('xdr:col', ns_draw)
+                                row_node = from_node.find('xdr:row', ns_draw)
+                                if col_node is None or row_node is None:
+                                    continue
+
+                                col = int(col_node.text) + 1
+                                row = int(row_node.text) + 1
+
+                                blip = pic_node.find('.//a:blip', ns_draw)
+                                if blip is None:
+                                    continue
+
+                                rid_embed = blip.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                                rid_link = blip.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link')
+                                rid = rid_embed or rid_link
+                                if not rid:
+                                    continue
+
+                                media_path = media_by_rid.get(rid)
+                                if not media_path:
+                                    continue
+
+                                # Solo nos interesan recursos internos de media
+                                if 'xl/media/' not in media_path.replace('\\', '/'):
+                                    continue
+
+                                if media_path not in z.namelist():
+                                    continue
+
+                                img_bytes = z.read(media_path)
+                                if not img_bytes:
+                                    continue
+
+                                candidates.append((row, col, media_path, img_bytes))
+
+                            print(f"   -> Candidatos de imagen resueltos: {len(candidates)}")
+
+                            # 6) Asignar foto/firma por fila usando orden horizontal (izq->der)
+                            # Esto evita depender de si Excel ancla en K/L o L/M.
+                            by_row = {}
+                            for row, col, media_path, img_bytes in candidates:
+                                by_row.setdefault(row, []).append((col, media_path, img_bytes))
+
+                            for row, items in by_row.items():
+                                items.sort(key=lambda x: x[0])
+
+                                if len(items) == 1:
+                                    col, media_path, img_bytes = items[0]
+                                    # regla simple por columna aproximada
+                                    if col <= 12:
+                                        fotos_por_fila[row] = img_bytes
+                                        print(f"   -> [ZIP-RELS] {media_path} es FOTO de Fila {row} (col={col})")
+                                    else:
+                                        firmas_por_fila[row] = img_bytes
+                                        print(f"   -> [ZIP-RELS] {media_path} es FIRMA de Fila {row} (col={col})")
+                                else:
+                                    # Izquierda = Foto, Derecha = Firma
+                                    col_f, media_f, bytes_f = items[0]
+                                    col_s, media_s, bytes_s = items[1]
+                                    fotos_por_fila[row] = bytes_f
+                                    firmas_por_fila[row] = bytes_s
+                                    print(f"   -> [ZIP-RELS] {media_f} es FOTO de Fila {row} (col={col_f})")
+                                    print(f"   -> [ZIP-RELS] {media_s} es FIRMA de Fila {row} (col={col_s})")
 
         except Exception as e:
-            print(f"❌ Falló Plan B Dual: {e}")
+            print(f"❌ Falló Plan B Dual (RELS): {e}")
 
     # Rebobinar siempre al final para que Pandas no falle después
     if hasattr(archivo, 'seek'): archivo.seek(0)
