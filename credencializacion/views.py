@@ -4,7 +4,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import Enrolamiento, SicreTblSig
 from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer
-from django.db.models import Q
+from django.db.models import Q, Count, Min
 from django.db import models
 from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
@@ -629,46 +629,64 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
             try:
                 # Leer el Excel
                 df = pd.read_excel(archivo)
+
+                # Normalizar cabeceras para evitar problemas de mayúsculas/espacios
+                df.columns = df.columns.str.strip().str.lower()
+
                 total_registros = len(df)
-                
-                # Extraer imágenes para saber qué filas tienen foto
-                imagenes_excel = extraer_imagenes_de_excel(archivo)
-                
+
+                # Extraer imágenes incrustadas separadas por columna (foto/firma)
+                fotos_excel, firmas_excel = extraer_imagenes_de_excel(archivo)
+
                 # Convertir a lista de diccionarios para el front
                 registros_preview = []
                 for index, row in df.iterrows():
-                    fila_excel = index + 2
-                    tiene_foto = fila_excel in imagenes_excel or pd.notnull(row.get('foto'))
-                    
+                    fila_excel = index + 2  # header + índice base 0
+
+                    # Detectar foto/firma con la misma lógica robusta de carga
+                    val_foto = row.get('foto')
+                    val_firma = row.get('firma')
+
+                    foto_bytes = procesar_foto_desde_excel(val_foto, fila_excel, fotos_excel)
+                    firma_bytes = procesar_foto_desde_excel(val_firma, fila_excel, firmas_excel)
+
+                    tiene_foto = foto_bytes is not None and len(foto_bytes) > 0
+                    tiene_firma = firma_bytes is not None and len(firma_bytes) > 0
+
                     registro = {
                         'num_empleado': row.get('num_empleado'),
-                        'rfc': row.get('rfc') or row.get('RFC'),
+                        'rfc': row.get('rfc'),
                         'curp': row.get('curp'),
                         'nombre': row.get('nombre'),
                         'paterno': row.get('paterno'),
                         'materno': row.get('materno'),
                         'puesto': row.get('puesto'),
                         'adscripcion': row.get('adscripcion'),
-                        'inicio_vig': row.get('Inicio Vigencia') or row.get('inicio_vig'),
-                        'fin_vig': row.get('Fin Vigencia') or row.get('fin_vig'),
+                        'inicio_vig': row.get('inicio_vig') or row.get('inicio vigencia'),
+                        'fin_vig': row.get('fin_vig') or row.get('fin vigencia'),
                         'eladia': row.get('eladia'),
-                        'foto': tiene_foto
+
+                        # Compatibilidad con front actual + explícitos
+                        'foto': tiene_foto,
+                        'firma': tiene_firma,
+                        'tiene_foto': tiene_foto,
+                        'tiene_firma': tiene_firma,
                     }
                     registros_preview.append(registro)
-                
+
                 return Response({
                     "status": "success",
                     "mensaje": "Vista previa generada correctamente",
                     "total_registros": total_registros,
                     "registros": registros_preview
                 }, status=status.HTTP_200_OK)
-                
+
             except Exception as e:
                 return Response({
                     "status": "error",
                     "mensaje": f"Error al leer el archivo: {str(e)}"
                 }, status=status.HTTP_400_BAD_REQUEST)
-        
+
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     # --- PASO 2: VALIDAR Y CARGAR (TODO EN UNO) ---
