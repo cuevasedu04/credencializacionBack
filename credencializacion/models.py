@@ -3,7 +3,7 @@ from django.db import models
 class Enrolamiento(models.Model):
     id_enrolamiento = models.AutoField(primary_key=True)
     num_empleado = models.CharField(max_length=20, blank=True, null=True)
-    rfc = models.CharField(max_length=13)
+    rfc = models.CharField(max_length=18)
     curp = models.CharField(max_length=18, blank=True, null=True)
     nombre = models.CharField(max_length=100, blank=True, null=True)
     paterno = models.CharField(max_length=100, blank=True, null=True)
@@ -43,8 +43,8 @@ class Enrolamiento(models.Model):
 
 class SicreTblSig(models.Model):
     num_empleado = models.CharField(max_length=20, blank=True, null=True)
-    rfc = models.CharField(max_length=13, primary_key=True)
-    curp = models.CharField(max_length=18, blank=True, null=True)
+    rfc = models.CharField(max_length=18, blank=True, null=True)
+    curp = models.CharField(max_length=18, primary_key=True)
     nombre = models.CharField(max_length=50, blank=True, null=True)
     paterno = models.CharField(max_length=50, blank=True, null=True)
     materno = models.CharField(max_length=50, blank=True, null=True)
@@ -55,6 +55,7 @@ class SicreTblSig(models.Model):
     fin_vig = models.DateField(blank=True, null=True)
     eladia = models.CharField(max_length=20, blank=True, null=True)
     foto = models.BinaryField(blank=True, null=True)
+    firma = models.BinaryField(blank=True, null=True)
     lote = models.CharField(max_length=50, blank=True, null=True)
     fecha_carga = models.DateTimeField(blank=True, null=True)
 

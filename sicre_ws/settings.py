@@ -28,7 +28,7 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-h!g0k_!j7y#9e6a+9-iw&lgmtyb#klr4vpdu3hmq_odnk5j!8r')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '168.231.73.222,localhost,127.0.0.1,sicre-anam.ddns.net,http://localhost:5555').split(',')
 CSRF_TRUSTED_ORIGINS = os.environ.get('CSRF_TRUSTED_ORIGINS', 'https://sicre-anam.ddns.net,https://168.231.73.222,https://localhost:5555').split(',')

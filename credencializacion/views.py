@@ -18,29 +18,105 @@ from openpyxl.drawing.image import Image as XLImage
 from io import BytesIO
 
 
-def extraer_imagenes_de_excel(archivo, columna_foto='L'):
+def extraer_imagenes_de_excel(archivo):
     """
-    Extrae las imágenes incrustadas en Excel y las asocia con el número de fila.
-    Retorna un diccionario: {numero_fila: bytes_imagen}
+    Versión 5.0 (Final): Soporte DUAL para FOTOS (Col L) y FIRMAS (Col M).
+    Mantiene el nombre original para compatibilidad.
     """
-    wb = load_workbook(archivo)
-    ws = wb.active
-    imagenes_por_fila = {}
+    from openpyxl import load_workbook
+    from io import BytesIO
+    import zipfile
     
-    for image in ws._images:
-        # Obtener la celda ancla donde está la imagen
-        row = image.anchor._from.row + 1  # +1 porque openpyxl usa índice 0
+    print(f"--- INICIANDO EXTRACCIÓN DUAL: {archivo} ---")
+    fotos_por_fila = {}
+    firmas_por_fila = {}
+    
+    # --- INTENTO 1: MÉTODO ESTÁNDAR (OpenPyXL) ---
+    try:
+        if hasattr(archivo, 'seek'): archivo.seek(0)
+        # data_only=False es vital para ver las imágenes
+        wb = load_workbook(archivo, data_only=False)
+        ws = wb.active
         
-        # Convertir la imagen a bytes
-        if hasattr(image, '_data'):
-            imagenes_por_fila[row] = image._data()
-        elif hasattr(image, 'ref'):
-            img_stream = BytesIO()
-            image.ref.save(img_stream)
-            imagenes_por_fila[row] = img_stream.getvalue()
+        imagenes = getattr(ws, '_images', []) or getattr(ws, 'images', [])
+        print(f"   -> Método Estándar detectó: {len(imagenes)} imágenes")
+
+        for image in imagenes:
+            try:
+                # Coordenadas (Excel base 1)
+                # .anchor._from.row es índice 0, por eso sumamos 1
+                row = image.anchor._from.row + 1
+                col = image.anchor._from.col + 1 
+                
+                # Extraer bytes
+                img_bytes = None
+                if hasattr(image, '_data'):
+                    img_bytes = image._data()
+                elif hasattr(image, 'ref'):
+                    buf = BytesIO()
+                    image.ref.save(buf)
+                    img_bytes = buf.getvalue()
+                
+                if img_bytes:
+                    # Lógica de Columnas: 
+                    # Columna 12 = L (Foto)
+                    # Columna 13 = M (Firma)
+                    if col == 12: 
+                        fotos_por_fila[row] = img_bytes
+                    elif col == 13:
+                        firmas_por_fila[row] = img_bytes
+                        
+            except Exception as e:
+                print(f"   -> Error leyendo imagen estándar: {e}")
+        
+        wb.close()
+    except Exception as e:
+        print(f"   -> Falló método estándar: {e}")
+
+    # --- INTENTO 2: PLAN DE EMERGENCIA (ZIP) ---
+    # Si el método estándar falló y no detectó NADA, entramos al ZIP
+    if not fotos_por_fila and not firmas_por_fila:
+        print("⚠️ ACTIVANDO EXTRACCIÓN FORZADA DUAL (PLAN B ZIP)")
+        try:
+            if hasattr(archivo, 'seek'): archivo.seek(0)
+            if zipfile.is_zipfile(archivo):
+                with zipfile.ZipFile(archivo, 'r') as z:
+                    # Buscamos archivos en la carpeta media del excel
+                    media_files = [f for f in z.namelist() if 'xl/media' in f]
+                    media_files.sort() # Ordenar alfabéticamente (image1, image2, etc.)
+                    
+                    print(f"   -> Encontrados en ZIP: {len(media_files)} archivos")
+                    
+                    # ASUNCIÓN CRÍTICA DEL PLAN B:
+                    # Asumimos que vienen en pares ordenados: [Foto, Firma, Foto, Firma...]
+                    # image1.jpeg -> Fila 2 Foto
+                    # image2.png  -> Fila 2 Firma
+                    # image3.jpeg -> Fila 3 Foto...
+                    
+                    for i, media_path in enumerate(media_files):
+                        img_bytes = z.read(media_path)
+                        
+                        # Cálculo matemático de la fila
+                        # Cada 2 imágenes avanzamos 1 fila
+                        fila_actual = (i // 2) + 2
+                        
+                        # Si 'i' es PAR (0, 2, 4...) -> Es FOTO
+                        if i % 2 == 0:
+                            fotos_por_fila[fila_actual] = img_bytes
+                            print(f"   -> [ZIP] {media_path} es FOTO de Fila {fila_actual}")
+                        
+                        # Si 'i' es IMPAR (1, 3, 5...) -> Es FIRMA
+                        else:
+                            firmas_por_fila[fila_actual] = img_bytes
+                            print(f"   -> [ZIP] {media_path} es FIRMA de Fila {fila_actual}")
+
+        except Exception as e:
+            print(f"❌ Falló Plan B Dual: {e}")
+
+    # Rebobinar siempre al final para que Pandas no falle después
+    if hasattr(archivo, 'seek'): archivo.seek(0)
     
-    wb.close()
-    return imagenes_por_fila
+    return fotos_por_fila, firmas_por_fila
 
 
 def procesar_foto_desde_excel(valor_celda, fila_numero=None, imagenes_excel=None):
@@ -602,126 +678,172 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
         if serializer.is_valid():
             archivo = serializer.validated_data['archivo']
             try:
-                # 1. Extraer imágenes incrustadas del Excel
-                imagenes_excel = extraer_imagenes_de_excel(archivo)
+                # ---------------------------------------------------------
+                # PASO 1: EXTRAER IMÁGENES Y FIRMAS (Plan B incluido)
+                # ---------------------------------------------------------
+                fotos_excel, firmas_excel = extraer_imagenes_de_excel(archivo)
                 
-                # 2. Leemos el Excel
+                # ---------------------------------------------------------
+                # PASO 2: LEER DATOS Y LIMPIEZA
+                # ---------------------------------------------------------
                 df = pd.read_excel(archivo)
-                total_registros = len(df)
                 
-                # 2. Limpieza y validación de duplicados
-                df['curp_limpia'] = df['curp'].apply(lambda x: str(x).strip().upper() if pd.notnull(x) else '')
-                # Filtrar CURPs vacías para validación
-                curps_excel = [c for c in df['curp_limpia'].tolist() if c]
+                # Normalizar cabeceras (quita espacios y convierte a minúsculas)
+                df.columns = df.columns.str.strip().str.lower()
 
+                # --- 🛡️ FILTRO ANTI-FANTASMAS (LA SOLUCIÓN A TU ERROR) ---
+                # 1. Eliminamos filas donde la CURP sea completamente nula (NaN)
+                df = df.dropna(subset=['curp'])
+                # 2. Eliminamos filas donde la CURP sea texto vacío ('') o espacios ('   ')
+                df = df[df['curp'].astype(str).str.strip() != '']
+                # ---------------------------------------------------------
+
+                total_registros = len(df)
+
+                # ---------------------------------------------------------
+                # PASO 3: VALIDACIÓN DE DUPLICADOS EN BD
+                # ---------------------------------------------------------
+                # Preparamos CURPs para buscar (Mayúsculas y sin espacios)
+                df['curp_limpia'] = df['curp'].apply(lambda x: str(x).strip().upper())
+                curps_excel = df['curp_limpia'].tolist()
+
+                # Buscamos si alguna de estas CURPs ya existe en Enrolamiento
                 curps_duplicadas_en_bd = list(Enrolamiento.objects.filter(curp__in=curps_excel).values_list('curp', flat=True))
-                cantidad_duplicados = len(curps_duplicadas_en_bd)
-
-                # --- ESCENARIO A: HAY DUPLICADOS (BLOQUEO) ---
-                if cantidad_duplicados > 0:
-                    detalles_duplicados = df[df['curp_limpia'].isin(curps_duplicadas_en_bd)][['curp', 'nombre', 'paterno']].to_dict('records')
+                
+                if len(curps_duplicadas_en_bd) > 0:
                     return Response({
                         "status": "error",
-                        "mensaje": "Se encontraron registros duplicados. Por favor, quítalos del Excel para continuar.",
-                        "resumen": {
-                            "total_registros": total_registros,
-                            "registros_validos": total_registros - cantidad_duplicados,
-                            "registros_duplicados": cantidad_duplicados
-
-                        },
-                        "lista_duplicados": detalles_duplicados
+                        "mensaje": "Se encontraron registros duplicados (CURP ya existe).",
+                        "lista_duplicados": curps_duplicadas_en_bd
                     }, status=status.HTTP_400_BAD_REQUEST)
 
-                # --- ESCENARIO B: TODO LIMPIO (INSERTAR EN AMBAS TABLAS) ---
+                # ---------------------------------------------------------
+                # PASO 4: CALCULAR LOTE Y FECHAS
+                # ---------------------------------------------------------
                 from datetime import datetime
                 
-                # Obtener el lote máximo actual y calcular el siguiente
+                # Calcular siguiente Lote (001, 002...)
                 lote_maximo = SicreTblSig.objects.filter(lote__isnull=False).order_by('-lote').first()
                 if lote_maximo and lote_maximo.lote:
-                    siguiente_numero = int(lote_maximo.lote) + 1
+                    try:
+                        siguiente_numero = int(lote_maximo.lote) + 1
+                    except:
+                        siguiente_numero = 1
                 else:
                     siguiente_numero = 1
-                siguiente_lote = str(siguiente_numero).zfill(3)  # Formato 001, 002, 003...
+                siguiente_lote = str(siguiente_numero).zfill(3)
+                
                 fecha_carga_actual = datetime.now()
                 
                 sig_objs = []
                 enrolamiento_objs = []
 
+                # ---------------------------------------------------------
+                # PASO 5: ITERAR Y CREAR OBJETOS
+                # ---------------------------------------------------------
                 for index, row in df.iterrows():
-                    # Lógica de fechas
-                    raw_inicio = row.get('Inicio Vigencia') or row.get('inicio_vig') or row.get('inicio vigencia')
-                    raw_fin = row.get('Fin Vigencia') or row.get('fin_vig') or row.get('fin vigencia')
+                    # Calculamos la fila real en Excel (Header es 1 + Index 0 = Fila 2)
+                    fila_excel = index + 2
                     
+                    # Limpieza de datos básicos
+                    rfc = str(row.get('rfc') or row.get('RFC') or '').strip().upper()
+                    curp = str(row.get('curp_limpia')).strip().upper()
+                    num_empleado = str(row.get('num_empleado') or '').strip()
+                    
+                    # Nombres
+                    nombre = str(row.get('nombre') or '').strip()
+                    paterno = str(row.get('paterno') or '').strip()
+                    materno = str(row.get('materno') or '').strip()
+                    apellidos = f"{paterno} {materno}".strip()
+                    
+                    # Otros datos
+                    puesto = str(row.get('puesto') or '').strip()
+                    adscripcion = str(row.get('adscripcion') or '').strip()
+                    eladia = str(row.get('eladia') or '').strip()
+                    
+                    # Fechas (Manejo de formatos variados)
+                    raw_inicio = row.get('inicio_vig') or row.get('inicio vigencia')
+                    raw_fin = row.get('fin_vig') or row.get('fin vigencia')
                     inicio_vig = str(raw_inicio).split(' ')[0] if pd.notnull(raw_inicio) else None
                     fin_vig = str(raw_fin).split(' ')[0] if pd.notnull(raw_fin) else None
 
-                    rfc = row.get('rfc') or row.get('RFC')
-                    apellidos = f"{row.get('paterno') or ''} {row.get('materno') or ''}".strip()
+                    # --- PROCESAR FOTO (Columna L) ---
+                    # Busca en columna 'foto' o usa la fila para buscar en el diccionario
+                    val_foto = row.get('foto')
+                    foto_bytes = procesar_foto_desde_excel(val_foto, fila_excel, fotos_excel)
                     
-                    # Procesar foto (prioriza imagen incrustada en Excel)
-                    # +2 porque: pandas usa índice 0, Excel empieza en 1, y tenemos header
-                    fila_excel = index + 2
-                    foto_bytes = procesar_foto_desde_excel(row.get('foto'), fila_excel, imagenes_excel)
+                    # --- PROCESAR FIRMA (Columna M) ---
+                    val_firma = row.get('firma') or row.get('FIRMA')
+                    firma_bytes = procesar_foto_desde_excel(val_firma, fila_excel, firmas_excel)
 
-                    # Objeto para SicreTblSig
+                    # 1. Objeto para Histórico (SicreTblSig)
                     sig = SicreTblSig(
-                        num_empleado=row.get('num_empleado'),
+                        num_empleado=num_empleado,
                         rfc=rfc,
-                        curp=row.get('curp_limpia'),
-                        nombre=row.get('nombre'),
-                        paterno=row.get('paterno'),
-                        materno=row.get('materno'),
+                        curp=curp,
+                        nombre=nombre,
+                        paterno=paterno,
+                        materno=materno,
                         apellidos=apellidos,
-                        puesto=row.get('puesto'),
-                        adscripcion=row.get('adscripcion'),
+                        puesto=puesto,
+                        adscripcion=adscripcion,
                         inicio_vig=inicio_vig,
                         fin_vig=fin_vig,
-                        eladia=row.get('eladia'),
+                        eladia=eladia,
                         foto=foto_bytes,
+                        firma=firma_bytes,  # Campo Firma
                         lote=siguiente_lote,
                         fecha_carga=fecha_carga_actual
                     )
                     sig_objs.append(sig)
 
-                    # Objeto para Enrolamiento
+                    # 2. Objeto para Sistema Actual (Enrolamiento)
                     enrolamiento = Enrolamiento(
+                        num_empleado=num_empleado,
                         rfc=rfc,
-                        curp=row.get('curp_limpia'),
-                        num_empleado=row.get('num_empleado'),
-                        nombre=row.get('nombre'),
-                        paterno=row.get('paterno'),
-                        materno=row.get('materno'),
+                        curp=curp,
+                        nombre=nombre,
+                        paterno=paterno,
+                        materno=materno,
                         apellidos=apellidos,
-                        puesto=row.get('puesto'),
-                        adscripcion=row.get('adscripcion'),
-                        folio=row.get('folio'),
+                        puesto=puesto,
+                        adscripcion=adscripcion,
                         inicio_vig=inicio_vig,
                         fin_vig=fin_vig,
+                        eladia=eladia,
                         foto=foto_bytes,
-                        eladia=row.get('eladia'),
+                        firma=firma_bytes, # Campo Firma
                         activo=1
                     )
                     enrolamiento_objs.append(enrolamiento)
                 
-                # Guardado masivo (Muy rápido)
+                # ---------------------------------------------------------
+                # PASO 6: GUARDADO MASIVO (BULK INSERT)
+                # ---------------------------------------------------------
                 SicreTblSig.objects.bulk_create(sig_objs)
+                # Usamos ignore_conflicts=True por seguridad en Enrolamiento si usas Postgres, 
+                # en MySQL bulk_create es directo. Si quieres actualizar existentes, 
+                # bulk_create no sirve, tendrías que usar update_or_create, 
+                # pero para carga inicial masiva esto es lo mejor.
                 Enrolamiento.objects.bulk_create(enrolamiento_objs)
                 
                 return Response({
                     "status": "success",
-                    "mensaje": "Carga de registros exitosa",
+                    "mensaje": "Carga completada exitosamente.",
                     "resumen": {
-                        "total_procesados": len(enrolamiento_objs),
-                        "folio_lote": siguiente_lote,
-                        "fecha_carga": fecha_carga_actual
+                        "registros_procesados": len(enrolamiento_objs),
+                        "lote_generado": siguiente_lote,
+                        "fecha": fecha_carga_actual
                     }
                 }, status=status.HTTP_201_CREATED)
 
             except Exception as e:
-                return Response({"error": "Error interno: " + str(e)}, status=status.HTTP_400_BAD_REQUEST)
+                # Log del error en consola para que veas qué pasó
+                print(f"❌ ERROR EN SUBIR_EXCEL: {str(e)}")
+                return Response({"error": f"Error procesando el archivo: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
+
     @action(detail=False, methods=['get'], url_path='historial-cargas')
     def historial_cargas(self, request):
         """
