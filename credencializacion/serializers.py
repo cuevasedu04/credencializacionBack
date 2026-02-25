@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Enrolamiento, SicreTblSig
+from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar
 import base64
 import binascii
 
@@ -79,9 +79,63 @@ class EnrolamientoSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class EnrolamientoDataTableSerializer(serializers.ModelSerializer):
+    foto = Base64BinaryField(
+        required=False,
+        allow_null=True,
+        style={'base_template': 'textarea.html'}
+    )
+    firma = Base64BinaryField(
+        required=False,
+        allow_null=True,
+        style={'base_template': 'textarea.html'}
+    )
+
     class Meta:
         model = Enrolamiento
         fields = '__all__'
+
+
+class EnrolamientoFamiliarSerializer(serializers.ModelSerializer):
+    foto = Base64BinaryField(
+        required=False,
+        allow_null=True,
+        style={'base_template': 'textarea.html'}
+    )
+    firma = Base64BinaryField(
+        required=False,
+        allow_null=True,
+        style={'base_template': 'textarea.html'}
+    )
+
+    class Meta:
+        model = EnrolamientoFamiliar
+        fields = [
+            'id_enrolamiento',
+            'num_empleado',
+            'rfc',
+            'curp',
+            'nombre',
+            'paterno',
+            'materno',
+            'apellidos',
+            'puesto',
+            'adscripcion',
+            'inicio_vig',
+            'fin_vig',
+            'eladia',
+            'foto',
+            'firma',
+            'folio_familiares',
+            'impreso',
+            'fecha_expedicion',
+            'id_usuario_registra',
+            'fecha_registro',
+            'fecha_enrolamiento',
+            'id_usuario_modifica',
+            'fecha_modificacion',
+            'ultima_carga',
+            'activo',
+        ]
 
 
 class SigSerializer(serializers.ModelSerializer):

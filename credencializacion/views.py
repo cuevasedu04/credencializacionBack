@@ -2,8 +2,8 @@
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from .models import Enrolamiento, SicreTblSig
-from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer
+from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar
+from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer
 from django.db.models import Q, Count, Min
 from django.db import models
 from django.contrib.auth import authenticate
@@ -334,14 +334,47 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         ).filter(
             Q(impreso__isnull=True) | Q(impreso=0) | ~Q(impreso=1)
         )
-        
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = EnrolamientoDataTableSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
 
-        serializer = EnrolamientoDataTableSerializer(queryset, many=True)
-        return Response(serializer.data)
+        queryset_familiares = EnrolamientoFamiliar.objects.exclude(
+            Q(foto__isnull=True) | Q(foto=b'') |
+            Q(firma__isnull=True) | Q(firma=b'')
+        ).filter(
+            Q(impreso__isnull=True) | Q(impreso=0) | ~Q(impreso=1)
+        )
+
+        serializer_enrolamiento = EnrolamientoDataTableSerializer(queryset, many=True)
+        serializer_familiar = EnrolamientoFamiliarSerializer(queryset_familiares, many=True)
+
+        data_enrolamiento = []
+        for item in serializer_enrolamiento.data:
+            registro = dict(item)
+            registro['source_table'] = 'enrolamiento'
+            if int(registro.get('nuevo_laredo') or 0) == 1:
+                registro['tipo_credencial'] = 'provisional'
+            elif int(registro.get('provisional') or 0) == 1:
+                registro['tipo_credencial'] = 'anam'
+            else:
+                registro['tipo_credencial'] = 'enrolamiento'
+            data_enrolamiento.append(registro)
+
+        data_familiares = []
+        for item in serializer_familiar.data:
+            registro = dict(item)
+            registro['source_table'] = 'familiar'
+            registro['tipo_credencial'] = 'familiar'
+            registro['folio'] = registro.get('folio_familiares')
+            data_familiares.append(registro)
+
+        data = sorted(
+            data_enrolamiento + data_familiares,
+            key=lambda x: x.get('fecha_enrolamiento') or x.get('fecha_registro') or '',
+            reverse=True
+        )
+        
+        page = self.paginate_queryset(data)
+        if page is not None:
+            return self.get_paginated_response(page)
+        return Response(data)
     
     @action(detail=False, methods=['get'])
     def pendientes(self, request):
@@ -414,19 +447,33 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         Retorna el folio máximo actual de la tabla enrolamiento.
         El front puede usar este valor para asignar el siguiente consecutivo.
         Respeta el formato con ceros a la izquierda (ej: 000001 -> 000002).
+        Permite separar series por nuevo_laredo con query param ?nuevo_laredo=0|1
         """
         try:
-            # Filtrar folios no nulos y obtener todos
-            folios = Enrolamiento.objects.exclude(
+            nuevo_laredo_param = request.query_params.get('nuevo_laredo', None)
+            folios_queryset = Enrolamiento.objects.exclude(
                 Q(folio__isnull=True) | Q(folio='')
-            ).values_list('folio', flat=True)
+            )
+
+            if nuevo_laredo_param in ['0', '1']:
+                nuevo_laredo_flag = int(nuevo_laredo_param)
+                if nuevo_laredo_flag == 1:
+                    folios_queryset = folios_queryset.filter(nuevo_laredo=1)
+                else:
+                    folios_queryset = folios_queryset.filter(
+                        Q(nuevo_laredo=0) | Q(nuevo_laredo__isnull=True)
+                    )
+
+            # Filtrar folios no nulos y obtener todos
+            folios = folios_queryset.values_list('folio', flat=True)
             
             if not folios:
                 # Si no hay folios, empezar desde 000001 (6 dígitos por defecto)
                 return Response({
                     'status': 'success',
                     'folio_maximo': '000000',
-                    'siguiente_folio': '000001'
+                    'siguiente_folio': '000001',
+                    'serie_nuevo_laredo': nuevo_laredo_param
                 }, status=status.HTTP_200_OK)
             
             # Encontrar el folio con mayor valor numérico
@@ -450,7 +497,8 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                 return Response({
                     'status': 'success',
                     'folio_maximo': '000000',
-                    'siguiente_folio': '000001'
+                    'siguiente_folio': '000001',
+                    'serie_nuevo_laredo': nuevo_laredo_param
                 }, status=status.HTTP_200_OK)
             
             # Calcular siguiente folio manteniendo el formato
@@ -460,7 +508,8 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             return Response({
                 'status': 'success',
                 'folio_maximo': folio_max_str,
-                'siguiente_folio': siguiente_folio
+                'siguiente_folio': siguiente_folio,
+                'serie_nuevo_laredo': nuevo_laredo_param
             }, status=status.HTTP_200_OK)
             
         except Exception as e:
@@ -736,6 +785,96 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             return Response({
                 'status': 'error',
                 'mensaje': f'Error al obtener estadísticas: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class EnrolamientoFamiliarViewSet(viewsets.ModelViewSet):
+    queryset = EnrolamientoFamiliar.objects.all().order_by('-id_enrolamiento')
+    serializer_class = EnrolamientoFamiliarSerializer
+
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['rfc', 'num_empleado', 'nombre', 'paterno', 'folio_familiares']
+
+    @action(detail=False, methods=['get'], url_path='obtener-folio-maximo-familiares')
+    def obtener_folio_maximo_familiares(self, request):
+        """
+        Retorna el folio máximo actual de familiares con consecutivo independiente.
+        Usa el campo folio_familiares y mantiene ceros a la izquierda.
+        """
+        try:
+            folios = EnrolamientoFamiliar.objects.exclude(
+                Q(folio_familiares__isnull=True) | Q(folio_familiares='')
+            ).values_list('folio_familiares', flat=True)
+
+            if not folios:
+                return Response({
+                    'status': 'success',
+                    'folio_maximo': '000000',
+                    'siguiente_folio': '000001'
+                }, status=status.HTTP_200_OK)
+
+            folio_max_valor = 0
+            folio_max_str = ''
+            longitud_formato = 6
+
+            for folio in folios:
+                folio_str = str(folio).strip()
+                solo_digitos = ''.join(ch for ch in folio_str if ch.isdigit())
+                if not solo_digitos:
+                    continue
+
+                valor = int(solo_digitos)
+                if valor > folio_max_valor:
+                    folio_max_valor = valor
+                    folio_max_str = folio_str
+                    longitud_formato = max(len(folio_str), 6)
+
+            if folio_max_valor == 0:
+                return Response({
+                    'status': 'success',
+                    'folio_maximo': '000000',
+                    'siguiente_folio': '000001'
+                }, status=status.HTTP_200_OK)
+
+            siguiente_valor = folio_max_valor + 1
+            siguiente_folio = str(siguiente_valor).zfill(longitud_formato)
+
+            return Response({
+                'status': 'success',
+                'folio_maximo': folio_max_str,
+                'siguiente_folio': siguiente_folio
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'mensaje': f'Error al obtener folio máximo de familiares: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], url_path='marcar-impreso')
+    def marcar_impreso(self, request, pk=None):
+        try:
+            enrolamiento = self.get_object()
+
+            enrolamiento.impreso = 1
+            enrolamiento.fecha_expedicion = request.data.get('fecha_expedicion')
+            enrolamiento.save()
+
+            return Response({
+                'status': 'success',
+                'mensaje': f'Credencial familiar {enrolamiento.folio_familiares or enrolamiento.id_enrolamiento} marcada como impresa',
+                'data': {
+                    'id_enrolamiento': enrolamiento.id_enrolamiento,
+                    'folio_familiares': enrolamiento.folio_familiares,
+                    'impreso': enrolamiento.impreso,
+                    'fecha_expedicion': enrolamiento.fecha_expedicion
+                }
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'mensaje': f'Error al marcar familiar como impreso: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class SigViewSet(viewsets.ReadOnlyModelViewSet):
