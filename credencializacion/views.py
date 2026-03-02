@@ -16,6 +16,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from io import BytesIO
+from django.utils import timezone
 
 
 def extraer_imagenes_de_excel(archivo):
@@ -527,9 +528,12 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         try:
             enrolamiento = self.get_object()
             
-            # Marcar como impreso y actualizar fecha
+            # Marcar como impreso y conservar la fecha de expedición original en reimpresiones.
             enrolamiento.impreso = 1
-            enrolamiento.fecha_expedicion = request.data.get('fecha_expedicion')  # Opcional: enviar desde front
+            fecha_expedicion_payload = request.data.get('fecha_expedicion')
+
+            if not enrolamiento.fecha_expedicion:
+                enrolamiento.fecha_expedicion = fecha_expedicion_payload or timezone.now().date()
             enrolamiento.save()
             
             return Response({
@@ -908,7 +912,10 @@ class EnrolamientoFamiliarViewSet(viewsets.ModelViewSet):
             enrolamiento = self.get_object()
 
             enrolamiento.impreso = 1
-            enrolamiento.fecha_expedicion = request.data.get('fecha_expedicion')
+            fecha_expedicion_payload = request.data.get('fecha_expedicion')
+
+            if not enrolamiento.fecha_expedicion:
+                enrolamiento.fecha_expedicion = fecha_expedicion_payload or timezone.now().date()
             enrolamiento.save()
 
             return Response({
