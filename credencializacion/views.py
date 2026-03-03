@@ -2,10 +2,11 @@
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar
 from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer
 from django.db.models import Q, Count, Min
-from django.db import models
+from django.db import models, transaction
 from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
@@ -407,21 +408,24 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         actualizados = 0
 
         for sig in registros_sig:
+            nombre = (sig.nombres or '').strip()
+            paterno = (sig.primer_apellido or '').strip()
+            materno = (sig.segundo_apellido or '').strip()
+            apellidos = f"{paterno} {materno}".strip()
+            rfc_ref = (sig.empleado_anam or sig.no_empleado or sig.curp or '').strip()
+
             obj, created = Enrolamiento.objects.update_or_create(
-                rfc=sig.rfc,
+                curp=sig.curp,
                 defaults={
-                    'num_empleado': sig.num_empleado,
+                    'rfc': rfc_ref,
+                    'num_empleado': sig.no_empleado,
                     'curp': sig.curp,
-                    'nombre': sig.nombre,
-                    'paterno': sig.paterno,
-                    'materno': sig.materno,
-                    'apellidos': sig.apellidos,
-                    'puesto': sig.puesto,
-                    'adscripcion': sig.adscripcion,
-                    'inicio_vig': sig.inicio_vig,
-                    'fin_vig': sig.fin_vig,
-                    'eladia': sig.eladia,
-                    'foto': sig.foto,
+                    'nombre': nombre,
+                    'paterno': paterno,
+                    'materno': materno,
+                    'apellidos': apellidos,
+                    'puesto': sig.cargo,
+                    'adscripcion': sig.area,
                     'activo': 1
                 }
             )
@@ -935,345 +939,487 @@ class EnrolamientoFamiliarViewSet(viewsets.ModelViewSet):
                 'mensaje': f'Error al marcar familiar como impreso: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-class SigViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = SicreTblSig.objects.all().order_by('nombre')
-    serializer_class = SigSerializer
-    
-    # Configuración del Buscador
-    filter_backends = [filters.SearchFilter]
-    search_fields = ['rfc', 'nombres']
+class SigPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 200
 
-    # --- PASO 1: PREVISUALIZAR EXCEL ---
+
+class SigViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = SicreTblSig.objects.all().order_by('nombres')
+    serializer_class = SigSerializer
+    pagination_class = SigPagination
+
+    filter_backends = [filters.SearchFilter]
+    search_fields = [
+        'empleado_anam', 'no_empleado', 'curp', 'nombres',
+        'primer_apellido', 'segundo_apellido', 'area', 'cargo',
+        'estatus', 'estado_hum', 'estado_nom', 'firma_drh', 'cargo_drh',
+    ]
+
+    COLUMN_ALIASES = {
+        'EMPLEADO_ANAM': ['EMPLEADO_ANAM', 'EMPLEADO ANAM'],
+        'NO_EMPLEADO': ['NO_EMPLEADO', 'NO EMPLEADO', 'NUM_EMPLEADO'],
+        'CURP': ['CURP'],
+        'NOMBRES': ['NOMBRES', 'NOMBRE'],
+        'PRIMER_APELLIDO': ['PRIMER_APELLIDO', 'PRIMER APELLIDO', 'PRIMER_APE', 'PATERNO'],
+        'SEGUNDO_APELLIDO': ['SEGUNDO_APELLIDO', 'SEGUNDO APELLIDO', 'SEGUNDO_APE', 'MATERNO'],
+        'AREA': ['AREA', 'ADSCRIPCION'],
+        'CARGO': ['CARGO', 'PUESTO'],
+        'FECHA_EXPEDICION': ['FECHA_EXPEDICION', 'FECHA EXPEDICION'],
+        'FIRMA_DRH': ['FIRMA_DRH', 'FIRMA DRH'],
+        'CARGO_DRH': ['CARGO_DRH', 'CARGO DRH'],
+        'QR': ['QR'],
+        'ESTATUS': ['ESTATUS', 'STATUS'],
+        'ESTADO_HUM': ['ESTADO_HUM', 'ESTADO HUM'],
+        'ESTADO_NOM': ['ESTADO_NOM', 'ESTADO NOM'],
+    }
+
+    REQUIRED_COLUMNS = list(COLUMN_ALIASES.keys())
+
+    @staticmethod
+    def _normalize_header(value):
+        return str(value or '').strip().upper().replace('.', '').replace('-', '_').replace(' ', '_')
+
+    @staticmethod
+    def _clean_text(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _clean_identifier(value, upper=False):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return None
+
+        if isinstance(value, float) and value.is_integer():
+            text = str(int(value))
+        else:
+            text = str(value).strip()
+
+        if not text:
+            return None
+
+        if text.endswith('.0') and text.replace('.', '', 1).isdigit():
+            text = text[:-2]
+
+        return text.upper() if upper else text
+
+    @staticmethod
+    def _parse_date(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return None
+        parsed = pd.to_datetime(value, errors='coerce')
+        if pd.isna(parsed):
+            return None
+        return parsed.date()
+
+    def _build_dataframe(self, archivo):
+        if hasattr(archivo, 'seek'):
+            archivo.seek(0)
+
+        df = pd.read_excel(archivo)
+        if df.empty:
+            return df, []
+
+        normalized_map = {self._normalize_header(col): col for col in df.columns}
+        selected_columns = {}
+        missing = []
+
+        for canonical, aliases in self.COLUMN_ALIASES.items():
+            source_col = None
+            for alias in aliases:
+                normalized_alias = self._normalize_header(alias)
+                if normalized_alias in normalized_map:
+                    source_col = normalized_map[normalized_alias]
+                    break
+
+            if source_col is None:
+                missing.append(canonical)
+            else:
+                selected_columns[canonical] = source_col
+
+        if missing:
+            return None, missing
+
+        normalized_df = pd.DataFrame({
+            canonical: df[source]
+            for canonical, source in selected_columns.items()
+        })
+
+        normalized_df['EMPLEADO_ANAM'] = normalized_df['EMPLEADO_ANAM'].apply(lambda x: self._clean_identifier(x) or '')
+        normalized_df['CURP'] = normalized_df['CURP'].apply(lambda x: self._clean_identifier(x, upper=True) or '')
+
+        normalized_df = normalized_df[normalized_df['EMPLEADO_ANAM'] != '']
+        normalized_df = normalized_df.drop_duplicates(subset=['EMPLEADO_ANAM'], keep='last')
+
+        return normalized_df, []
+
+    def _sig_payload_from_row(self, row):
+        return {
+            'empleado_anam': self._clean_identifier(row.get('EMPLEADO_ANAM')),
+            'no_empleado': self._clean_identifier(row.get('NO_EMPLEADO')),
+            'curp': self._clean_identifier(row.get('CURP'), upper=True),
+            'nombres': self._clean_text(row.get('NOMBRES')),
+            'primer_apellido': self._clean_text(row.get('PRIMER_APELLIDO')),
+            'segundo_apellido': self._clean_text(row.get('SEGUNDO_APELLIDO')),
+            'area': self._clean_text(row.get('AREA')),
+            'cargo': self._clean_text(row.get('CARGO')),
+            'fecha_expedicion': self._parse_date(row.get('FECHA_EXPEDICION')),
+            'firma_drh': self._clean_text(row.get('FIRMA_DRH')),
+            'cargo_drh': self._clean_text(row.get('CARGO_DRH')),
+            'qr': self._clean_text(row.get('QR')),
+            'estatus': self._clean_text(row.get('ESTATUS')),
+            'estado_hum': self._clean_text(row.get('ESTADO_HUM')),
+            'estado_nom': self._clean_text(row.get('ESTADO_NOM')),
+        }
+
     @action(detail=False, methods=['POST'], serializer_class=ArchivoExcelSerializer)
     def previsualizar_excel(self, request):
-        """
-        Lee el Excel y retorna una vista previa de los datos sin guardar nada.
-        """
         serializer = ArchivoExcelSerializer(data=request.data)
-        if serializer.is_valid():
+        serializer.is_valid(raise_exception=True)
+
+        try:
             archivo = serializer.validated_data['archivo']
-            try:
-                # Leer el Excel
-                df = pd.read_excel(archivo)
+            df, missing = self._build_dataframe(archivo)
 
-                # Normalizar cabeceras para evitar problemas de mayúsculas/espacios
-                df.columns = df.columns.str.strip().str.lower()
-
-                total_registros = len(df)
-
-                # Extraer imágenes incrustadas separadas por columna (foto/firma)
-                fotos_excel, firmas_excel = extraer_imagenes_de_excel(archivo)
-
-                # Convertir a lista de diccionarios para el front
-                registros_preview = []
-                for index, row in df.iterrows():
-                    fila_excel = index + 2  # header + índice base 0
-
-                    # Detectar foto/firma con la misma lógica robusta de carga
-                    val_foto = row.get('foto')
-                    val_firma = row.get('firma')
-
-                    foto_bytes = procesar_foto_desde_excel(val_foto, fila_excel, fotos_excel)
-                    firma_bytes = procesar_foto_desde_excel(val_firma, fila_excel, firmas_excel)
-
-                    tiene_foto = foto_bytes is not None and len(foto_bytes) > 0
-                    tiene_firma = firma_bytes is not None and len(firma_bytes) > 0
-
-                    registro = {
-                        'num_empleado': row.get('num_empleado'),
-                        'rfc': row.get('rfc'),
-                        'curp': row.get('curp'),
-                        'nombre': row.get('nombre'),
-                        'paterno': row.get('paterno'),
-                        'materno': row.get('materno'),
-                        'puesto': row.get('puesto'),
-                        'adscripcion': row.get('adscripcion'),
-                        'inicio_vig': row.get('inicio_vig') or row.get('inicio vigencia'),
-                        'fin_vig': row.get('fin_vig') or row.get('fin vigencia'),
-                        'eladia': row.get('eladia'),
-
-                        # Compatibilidad con front actual + explícitos
-                        'foto': tiene_foto,
-                        'firma': tiene_firma,
-                        'tiene_foto': tiene_foto,
-                        'tiene_firma': tiene_firma,
-                    }
-                    registros_preview.append(registro)
-
+            if missing:
                 return Response({
-                    "status": "success",
-                    "mensaje": "Vista previa generada correctamente",
-                    "total_registros": total_registros,
-                    "registros": registros_preview
-                }, status=status.HTTP_200_OK)
-
-            except Exception as e:
-                return Response({
-                    "status": "error",
-                    "mensaje": f"Error al leer el archivo: {str(e)}"
+                    'status': 'error',
+                    'mensaje': 'El archivo no contiene todas las columnas requeridas de SIG.',
+                    'columnas_faltantes': missing
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            total_registros = 0 if df is None else len(df)
+            preview_limit = min(max(int(request.query_params.get('preview_limit', 200)), 1), 500)
+            preview_df = df.head(preview_limit) if df is not None else pd.DataFrame()
 
-    # --- PASO 2: VALIDAR Y CARGAR (TODO EN UNO) ---
+            registros_preview = []
+            for _, row in preview_df.iterrows():
+                registro = self._sig_payload_from_row(row)
+                registros_preview.append(registro)
+
+            return Response({
+                'status': 'success',
+                'mensaje': 'Vista previa generada correctamente',
+                'total_registros': total_registros,
+                'registros': registros_preview,
+                'preview_limit': preview_limit,
+                'preview_registros': len(registros_preview),
+                'preview_parcial': total_registros > len(registros_preview)
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'mensaje': f'Error al leer el archivo: {str(e)}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
     @action(detail=False, methods=['POST'], serializer_class=ArchivoExcelSerializer)
     def subir_excel(self, request):
         serializer = ArchivoExcelSerializer(data=request.data)
-        if serializer.is_valid():
+        serializer.is_valid(raise_exception=True)
+
+        try:
             archivo = serializer.validated_data['archivo']
-            try:
-                # ---------------------------------------------------------
-                # PASO 1: EXTRAER IMÁGENES Y FIRMAS (Plan B incluido)
-                # ---------------------------------------------------------
-                fotos_excel, firmas_excel = extraer_imagenes_de_excel(archivo)
-                
-                # ---------------------------------------------------------
-                # PASO 2: LEER DATOS Y LIMPIEZA
-                # ---------------------------------------------------------
-                df = pd.read_excel(archivo)
-                
-                # Normalizar cabeceras (quita espacios y convierte a minúsculas)
-                df.columns = df.columns.str.strip().str.lower()
+            df, missing = self._build_dataframe(archivo)
 
-                # --- 🛡️ FILTRO ANTI-FANTASMAS (LA SOLUCIÓN A TU ERROR) ---
-                # 1. Eliminamos filas donde la CURP sea completamente nula (NaN)
-                df = df.dropna(subset=['curp'])
-                # 2. Eliminamos filas donde la CURP sea texto vacío ('') o espacios ('   ')
-                df = df[df['curp'].astype(str).str.strip() != '']
-                # ---------------------------------------------------------
-
-                total_registros = len(df)
-
-                # ---------------------------------------------------------
-                # PASO 3: VALIDACIÓN DE DUPLICADOS EN BD
-                # ---------------------------------------------------------
-                # Preparamos CURPs para buscar (Mayúsculas y sin espacios)
-                df['curp_limpia'] = df['curp'].apply(lambda x: str(x).strip().upper())
-                curps_excel = df['curp_limpia'].tolist()
-
-                # Buscamos si alguna de estas CURPs ya existe en Enrolamiento
-                curps_duplicadas_en_bd = list(Enrolamiento.objects.filter(curp__in=curps_excel).values_list('curp', flat=True))
-                
-                if len(curps_duplicadas_en_bd) > 0:
-                    return Response({
-                        "status": "error",
-                        "mensaje": "Se encontraron registros duplicados (CURP ya existe).",
-                        "lista_duplicados": curps_duplicadas_en_bd
-                    }, status=status.HTTP_400_BAD_REQUEST)
-
-                # ---------------------------------------------------------
-                # PASO 4: CALCULAR LOTE Y FECHAS
-                # ---------------------------------------------------------
-                from datetime import datetime
-                
-                # Calcular siguiente Lote (001, 002...)
-                lote_maximo = SicreTblSig.objects.filter(lote__isnull=False).order_by('-lote').first()
-                if lote_maximo and lote_maximo.lote:
-                    try:
-                        siguiente_numero = int(lote_maximo.lote) + 1
-                    except:
-                        siguiente_numero = 1
-                else:
-                    siguiente_numero = 1
-                siguiente_lote = str(siguiente_numero).zfill(3)
-                
-                fecha_carga_actual = datetime.now()
-                
-                sig_objs = []
-                enrolamiento_objs = []
-
-                # ---------------------------------------------------------
-                # PASO 5: ITERAR Y CREAR OBJETOS
-                # ---------------------------------------------------------
-                for index, row in df.iterrows():
-                    # Calculamos la fila real en Excel (Header es 1 + Index 0 = Fila 2)
-                    fila_excel = index + 2
-                    
-                    # Limpieza de datos básicos
-                    rfc = str(row.get('rfc') or row.get('RFC') or '').strip().upper()
-                    curp = str(row.get('curp_limpia')).strip().upper()
-                    num_empleado = str(row.get('num_empleado') or '').strip()
-                    
-                    # Nombres
-                    nombre = str(row.get('nombre') or '').strip()
-                    paterno = str(row.get('paterno') or '').strip()
-                    materno = str(row.get('materno') or '').strip()
-                    apellidos = f"{paterno} {materno}".strip()
-                    
-                    # Otros datos
-                    puesto = str(row.get('puesto') or '').strip()
-                    adscripcion = str(row.get('adscripcion') or '').strip()
-                    eladia = str(row.get('eladia') or '').strip()
-                    
-                    # Fechas (Manejo de formatos variados)
-                    raw_inicio = row.get('inicio_vig') or row.get('inicio vigencia')
-                    raw_fin = row.get('fin_vig') or row.get('fin vigencia')
-                    inicio_vig = str(raw_inicio).split(' ')[0] if pd.notnull(raw_inicio) else None
-                    fin_vig = str(raw_fin).split(' ')[0] if pd.notnull(raw_fin) else None
-
-                    # --- PROCESAR FOTO (Columna L) ---
-                    # Busca en columna 'foto' o usa la fila para buscar en el diccionario
-                    val_foto = row.get('foto')
-                    foto_bytes = procesar_foto_desde_excel(val_foto, fila_excel, fotos_excel)
-                    
-                    # --- PROCESAR FIRMA (Columna M) ---
-                    val_firma = row.get('firma') or row.get('FIRMA')
-                    firma_bytes = procesar_foto_desde_excel(val_firma, fila_excel, firmas_excel)
-
-                    # 1. Objeto para Histórico (SicreTblSig)
-                    sig = SicreTblSig(
-                        num_empleado=num_empleado,
-                        rfc=rfc,
-                        curp=curp,
-                        nombre=nombre,
-                        paterno=paterno,
-                        materno=materno,
-                        apellidos=apellidos,
-                        puesto=puesto,
-                        adscripcion=adscripcion,
-                        inicio_vig=inicio_vig,
-                        fin_vig=fin_vig,
-                        eladia=eladia,
-                        foto=foto_bytes,
-                        firma=firma_bytes,  # Campo Firma
-                        lote=siguiente_lote,
-                        fecha_carga=fecha_carga_actual
-                    )
-                    sig_objs.append(sig)
-
-                    # 2. Objeto para Sistema Actual (Enrolamiento)
-                    enrolamiento = Enrolamiento(
-                        num_empleado=num_empleado,
-                        rfc=rfc,
-                        curp=curp,
-                        nombre=nombre,
-                        paterno=paterno,
-                        materno=materno,
-                        apellidos=apellidos,
-                        puesto=puesto,
-                        adscripcion=adscripcion,
-                        inicio_vig=inicio_vig,
-                        fin_vig=fin_vig,
-                        eladia=eladia,
-                        foto=foto_bytes,
-                        firma=firma_bytes, # Campo Firma
-                        activo=1
-                    )
-                    enrolamiento_objs.append(enrolamiento)
-                
-                # ---------------------------------------------------------
-                # PASO 6: GUARDADO MASIVO (BULK INSERT)
-                # ---------------------------------------------------------
-                SicreTblSig.objects.bulk_create(sig_objs)
-                # Usamos ignore_conflicts=True por seguridad en Enrolamiento si usas Postgres, 
-                # en MySQL bulk_create es directo. Si quieres actualizar existentes, 
-                # bulk_create no sirve, tendrías que usar update_or_create, 
-                # pero para carga inicial masiva esto es lo mejor.
-                Enrolamiento.objects.bulk_create(enrolamiento_objs)
-                
+            if missing:
                 return Response({
-                    "status": "success",
-                    "mensaje": "Carga completada exitosamente.",
-                    "resumen": {
-                        "registros_procesados": len(enrolamiento_objs),
-                        "lote_generado": siguiente_lote,
-                        "fecha": fecha_carga_actual
-                    }
-                }, status=status.HTTP_201_CREATED)
+                    'status': 'error',
+                    'mensaje': 'El archivo no contiene todas las columnas requeridas de SIG.',
+                    'columnas_faltantes': missing
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            except Exception as e:
-                # Log del error en consola para que veas qué pasó
-                print(f"❌ ERROR EN SUBIR_EXCEL: {str(e)}")
-                return Response({"error": f"Error procesando el archivo: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            if df is None or df.empty:
+                return Response({
+                    'status': 'error',
+                    'mensaje': 'No hay registros válidos para procesar.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            rows = [self._sig_payload_from_row(row) for _, row in df.iterrows()]
+
+            # --- Validación de duplicados en el archivo ---
+            curp_count = {}
+            num_emp_count = {}
+            for r in rows:
+                c = (r.get('curp') or '').strip()
+                n = (r.get('no_empleado') or '').strip()
+                if c:
+                    curp_count[c] = curp_count.get(c, 0) + 1
+                if n:
+                    num_emp_count[n] = num_emp_count.get(n, 0) + 1
+
+            curps_dup = [c for c, cnt in curp_count.items() if cnt > 1]
+            nums_dup  = [n for n, cnt in num_emp_count.items() if cnt > 1]
+
+            if curps_dup or nums_dup:
+                errores = {}
+                if curps_dup:
+                    errores['curps_duplicadas'] = curps_dup
+                if nums_dup:
+                    errores['numeros_empleado_duplicados'] = nums_dup
+                return Response({
+                    'status': 'error',
+                    'mensaje': 'El archivo contiene registros duplicados. No puede haber más de un empleado con la misma CURP o el mismo número de empleado.',
+                    **errores
+                }, status=status.HTTP_400_BAD_REQUEST)
+            # --- Fin validación duplicados ---
+
+            rows_by_empleado = {}
+            for row in rows:
+                empleado_key = row.get('empleado_anam')
+                if not empleado_key:
+                    continue
+                rows_by_empleado[empleado_key] = row
+
+            rows = list(rows_by_empleado.values())
+            empleados_anam = [row['empleado_anam'] for row in rows if row.get('empleado_anam')]
+            curps = [row['curp'] for row in rows if row.get('curp')]
+
+            sig_create = []
+            sig_update = []
+            enr_create = []
+            enr_update = []
+
+            sig_existing = SicreTblSig.objects.in_bulk(empleados_anam)
+            sig_existing_by_curp_qs = SicreTblSig.objects.filter(curp__in=curps)
+            sig_existing_by_curp = {}
+            for obj in sig_existing_by_curp_qs:
+                if obj.curp and obj.curp not in sig_existing_by_curp:
+                    sig_existing_by_curp[obj.curp] = obj
+
+            enr_existing_qs = Enrolamiento.objects.filter(curp__in=curps).order_by('-id_enrolamiento')
+            enr_existing = {}
+            for obj in enr_existing_qs:
+                if obj.curp and obj.curp not in enr_existing:
+                    enr_existing[obj.curp] = obj
+
+            max_id = SicreTblSig.objects.aggregate(max_id=models.Max('id')).get('max_id') or 0
+            next_id = int(max_id)
+            now_ts = timezone.now()
+
+            def normalized_text(value):
+                if value is None:
+                    return ''
+                return str(value).strip()
+
+            def same_text(current, incoming):
+                return normalized_text(current) == normalized_text(incoming)
+
+            def same_date(current, incoming):
+                return current == incoming
+
+            for row in rows:
+                empleado_anam = row['empleado_anam']
+                curp = row.get('curp')
+                if not empleado_anam:
+                    continue
+
+                sig_obj = sig_existing.get(empleado_anam)
+                if not sig_obj and curp:
+                    sig_obj = sig_existing_by_curp.get(curp)
+                if sig_obj:
+                    sig_changed = False
+
+                    if sig_obj.id is None:
+                        next_id += 1
+                        sig_obj.id = next_id
+                        sig_changed = True
+
+                    sig_new_values = {
+                        'no_empleado': row['no_empleado'],
+                        'curp': row['curp'],
+                        'nombres': row['nombres'],
+                        'primer_apellido': row['primer_apellido'],
+                        'segundo_apellido': row['segundo_apellido'],
+                        'area': row['area'],
+                        'cargo': row['cargo'],
+                        'fecha_expedicion': row['fecha_expedicion'],
+                        'firma_drh': row['firma_drh'],
+                        'cargo_drh': row['cargo_drh'],
+                        'qr': row['qr'],
+                        'estatus': row['estatus'],
+                        'estado_hum': row['estado_hum'],
+                        'estado_nom': row['estado_nom'],
+                    }
+
+                    for field_name, new_value in sig_new_values.items():
+                        current_value = getattr(sig_obj, field_name)
+                        is_same = same_date(current_value, new_value) if field_name == 'fecha_expedicion' else same_text(current_value, new_value)
+                        if not is_same:
+                            setattr(sig_obj, field_name, new_value)
+                            sig_changed = True
+
+                    if sig_changed:
+                        sig_obj.fecha_actualizacion = now_ts
+                        sig_update.append(sig_obj)
+                else:
+                    next_id += 1
+                    sig_create.append(SicreTblSig(
+                        id=next_id,
+                        fecha_actualizacion=now_ts,
+                        **row
+                    ))
+
+                nombre = (row.get('nombres') or '').strip()
+                paterno = (row.get('primer_apellido') or '').strip()
+                materno = (row.get('segundo_apellido') or '').strip()
+                apellidos = f"{paterno} {materno}".strip()
+                estatus = (row.get('estatus') or '').lower()
+                activo_flag = 0 if 'baja' in estatus else 1
+                rfc_ref = (row.get('empleado_anam') or row.get('no_empleado') or curp or '').strip()
+
+                if not curp:
+                    continue
+
+                enr_obj = enr_existing.get(curp)
+                if enr_obj:
+                    enr_changed = False
+                    enr_new_values = {
+                        'rfc': rfc_ref,
+                        'num_empleado': row.get('no_empleado'),
+                        'nombre': nombre,
+                        'paterno': paterno,
+                        'materno': materno,
+                        'apellidos': apellidos,
+                        'puesto': row.get('cargo'),
+                        'adscripcion': row.get('area'),
+                        'activo': activo_flag,
+                    }
+
+                    for field_name, new_value in enr_new_values.items():
+                        current_value = getattr(enr_obj, field_name)
+                        is_same = current_value == new_value if field_name == 'activo' else same_text(current_value, new_value)
+                        if not is_same:
+                            setattr(enr_obj, field_name, new_value)
+                            enr_changed = True
+
+                    if enr_changed:
+                        enr_obj.fecha_modificacion = timezone.now()
+                        enr_update.append(enr_obj)
+                else:
+                    enr_create.append(Enrolamiento(
+                        rfc=rfc_ref,
+                        num_empleado=row.get('no_empleado'),
+                        curp=curp,
+                        nombre=nombre,
+                        paterno=paterno,
+                        materno=materno,
+                        apellidos=apellidos,
+                        puesto=row.get('cargo'),
+                        adscripcion=row.get('area'),
+                        activo=activo_flag,
+                        fecha_enrolamiento=timezone.now()
+                    ))
+
+            sig_update = list({obj.empleado_anam: obj for obj in sig_update}.values())
+            enr_update = list({obj.id_enrolamiento: obj for obj in enr_update}.values())
+
+            if not sig_create and not sig_update and not enr_create and not enr_update:
+                resumen_sin_cambios = {
+                    'registros_archivo': len(rows),
+                    'sig_creados': 0,
+                    'sig_actualizados': 0,
+                    'enrolamiento_creados': 0,
+                    'enrolamiento_actualizados': 0
+                }
+                return Response({
+                    'status': 'success',
+                    'mensaje': 'No se encontraron nuevos empleados ni actualizaciones de registros.',
+                    'resumen': resumen_sin_cambios
+                }, status=status.HTTP_200_OK)
+
+            with transaction.atomic():
+                if sig_create:
+                    SicreTblSig.objects.bulk_create(sig_create, batch_size=1000)
+                if sig_update:
+                    SicreTblSig.objects.bulk_update(
+                        sig_update,
+                        ['id', 'no_empleado', 'curp', 'nombres', 'primer_apellido', 'segundo_apellido', 'area', 'cargo', 'fecha_expedicion', 'firma_drh', 'cargo_drh', 'qr', 'estatus', 'estado_hum', 'estado_nom', 'fecha_actualizacion'],
+                        batch_size=1000
+                    )
+
+                if enr_create:
+                    Enrolamiento.objects.bulk_create(enr_create, batch_size=1000)
+                if enr_update:
+                    Enrolamiento.objects.bulk_update(
+                        enr_update,
+                        ['rfc', 'num_empleado', 'nombre', 'paterno', 'materno', 'apellidos', 'puesto', 'adscripcion', 'activo', 'fecha_modificacion'],
+                        batch_size=1000
+                    )
+
+            resumen = {
+                'registros_archivo': len(rows),
+                'sig_creados': len(sig_create),
+                'sig_actualizados': len(sig_update),
+                'enrolamiento_creados': len(enr_create),
+                'enrolamiento_actualizados': len(enr_update),
+                'detalle_empleados': [
+                    {
+                        'no_empleado': obj.no_empleado or '',
+                        'nombre': f"{obj.nombres or ''} {obj.primer_apellido or ''} {obj.segundo_apellido or ''}".strip(),
+                        'tipo': 'Nuevo ingreso'
+                    }
+                    for obj in sig_create
+                ] + [
+                    {
+                        'no_empleado': obj.no_empleado or '',
+                        'nombre': f"{obj.nombres or ''} {obj.primer_apellido or ''} {obj.segundo_apellido or ''}".strip(),
+                        'tipo': 'Actualización'
+                    }
+                    for obj in sig_update
+                ]
+            }
+
+            sin_cambios = (
+                resumen['sig_creados'] == 0 and
+                resumen['sig_actualizados'] == 0 and
+                resumen['enrolamiento_creados'] == 0 and
+                resumen['enrolamiento_actualizados'] == 0
+            )
+
+            return Response({
+                'status': 'success',
+                'mensaje': 'No se encontraron nuevos empleados ni actualizaciones de registros.' if sin_cambios else 'Consulta de SIG actualizada exitosamente.',
+                'resumen': resumen
+            }, status=status.HTTP_200_OK if sin_cambios else status.HTTP_201_CREATED)
+
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'mensaje': f'Error procesando el archivo: {str(e)}'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=['get'], url_path='historial-cargas')
     def historial_cargas(self, request):
-        """
-        Retorna un resumen de todas las cargas masivas realizadas.
-        Incluye: lote, fecha_carga, total_registros, y nombres de los primeros 10 registros.
-        """
-        from django.db.models import Count, Min
-        
         try:
-            # Obtener todos los lotes distintos con información agregada
-            lotes = SicreTblSig.objects.values('lote', 'fecha_carga').annotate(
-                total_registros=Count('rfc'),
-                primera_carga=Min('fecha_carga')
-            ).filter(lote__isnull=False).order_by('-lote')
-            
-            resultado = []
-            for lote_info in lotes:
-                lote_num = lote_info['lote']
-                
-                # Obtener los primeros 10 registros de este lote
-                primeros_10 = SicreTblSig.objects.filter(lote=lote_num).values(
-                    'nombre', 'paterno', 'materno'
-                )[:10]
-                
-                # Construir nombres completos
-                nombres_preview = [
-                    f"{r['nombre']} {r['paterno']} {r['materno'] or ''}".strip()
-                    for r in primeros_10
-                ]
-                
-                resultado.append({
-                    'lote': lote_num,
-                    'fecha_carga': lote_info['primera_carga'],
-                    'total_registros': lote_info['total_registros'],
-                    'preview_nombres': nombres_preview
-                })
-            
+            resumen_estatus = list(
+                SicreTblSig.objects.values('estatus').annotate(total=Count('empleado_anam')).order_by('-total')[:10]
+            )
+            preview = list(
+                SicreTblSig.objects.values('empleado_anam', 'curp', 'nombres', 'primer_apellido', 'segundo_apellido', 'fecha_actualizacion')[:10]
+            )
+
             return Response({
                 'status': 'success',
-                'total_cargas': len(resultado),
-                'cargas': resultado
+                'total_registros': SicreTblSig.objects.count(),
+                'por_estatus': resumen_estatus,
+                'preview': preview
             }, status=status.HTTP_200_OK)
-            
         except Exception as e:
             return Response({
                 'status': 'error',
                 'mensaje': f'Error al obtener historial: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
+
     @action(detail=False, methods=['get'], url_path='detalle-lote/(?P<lote_id>[0-9]+)')
     def detalle_lote(self, request, lote_id=None):
-        """
-        Retorna todos los registros de un lote específico.
-        Parámetro: lote_id (entero) - Número de lote a consultar
-        """
-        try:
-            # Validar que el lote existe
-            if not SicreTblSig.objects.filter(lote=lote_id).exists():
-                return Response({
-                    'status': 'error',
-                    'mensaje': f'El lote {lote_id} no existe'
-                }, status=status.HTTP_404_NOT_FOUND)
-            
-            # Obtener todos los registros del lote
-            registros = SicreTblSig.objects.filter(lote=lote_id).order_by('rfc')
-            serializer = SigSerializer(registros, many=True)
-            
-            # Información del lote
-            info_lote = SicreTblSig.objects.filter(lote=lote_id).aggregate(
-                total_registros=Count('rfc'),
-                fecha_carga=Min('fecha_carga')
-            )
-            
-            return Response({
-                'status': 'success',
-                'lote': int(lote_id),
-                'fecha_carga': info_lote['fecha_carga'],
-                'total_registros': info_lote['total_registros'],
-                'registros': serializer.data
-            }, status=status.HTTP_200_OK)
-            
-        except Exception as e:
-            return Response({
-                'status': 'error',
-                'mensaje': f'Error al obtener detalle del lote: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({
+            'status': 'error',
+            'mensaje': 'Detalle por lote ya no aplica en el nuevo esquema SIG.'
+        }, status=status.HTTP_410_GONE)
 
 
 class CustomLoginView(APIView):

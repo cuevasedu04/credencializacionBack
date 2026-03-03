@@ -85,22 +85,23 @@ class EnrolamientoFamiliar(models.Model):
 
 
 class SicreTblSig(models.Model):
-    num_empleado = models.CharField(max_length=20, blank=True, null=True)
-    rfc = models.CharField(max_length=18, blank=True, null=True)
-    curp = models.CharField(max_length=18, primary_key=True)
-    nombre = models.CharField(max_length=50, blank=True, null=True)
-    paterno = models.CharField(max_length=50, blank=True, null=True)
-    materno = models.CharField(max_length=50, blank=True, null=True)
-    apellidos = models.CharField(max_length=100, blank=True, null=True)
-    puesto = models.CharField(max_length=100, blank=True, null=True)
-    adscripcion = models.CharField(max_length=100, blank=True, null=True)
-    inicio_vig = models.DateField(blank=True, null=True)
-    fin_vig = models.DateField(blank=True, null=True)
-    eladia = models.CharField(max_length=20, blank=True, null=True)
-    foto = models.BinaryField(blank=True, null=True)
-    firma = models.BinaryField(blank=True, null=True)
-    lote = models.CharField(max_length=50, blank=True, null=True)
-    fecha_carga = models.DateTimeField(blank=True, null=True)
+    id = models.BigIntegerField(db_column='ID', blank=True, null=True, db_index=True)
+    empleado_anam = models.CharField(db_column='EMPLEADO_ANAM', max_length=50, primary_key=True)
+    no_empleado = models.CharField(db_column='NO_EMPLEADO', max_length=50, blank=True, null=True)
+    curp = models.CharField(db_column='CURP', max_length=18, blank=True, null=True)
+    nombres = models.CharField(db_column='NOMBRES', max_length=150, blank=True, null=True)
+    primer_apellido = models.CharField(db_column='PRIMER_APELLIDO', max_length=100, blank=True, null=True)
+    segundo_apellido = models.CharField(db_column='SEGUNDO_APELLIDO', max_length=100, blank=True, null=True)
+    area = models.CharField(db_column='AREA', max_length=150, blank=True, null=True)
+    cargo = models.CharField(db_column='CARGO', max_length=150, blank=True, null=True)
+    fecha_expedicion = models.DateField(db_column='FECHA_EXPEDICION', blank=True, null=True)
+    firma_drh = models.CharField(db_column='FIRMA_DRH', max_length=255, blank=True, null=True)
+    cargo_drh = models.CharField(db_column='CARGO_DRH', max_length=255, blank=True, null=True)
+    qr = models.TextField(db_column='QR', blank=True, null=True)
+    estatus = models.CharField(db_column='ESTATUS', max_length=100, blank=True, null=True)
+    estado_hum = models.CharField(db_column='ESTADO_HUM', max_length=100, blank=True, null=True)
+    estado_nom = models.CharField(db_column='ESTADO_NOM', max_length=100, blank=True, null=True)
+    fecha_actualizacion = models.DateTimeField(db_column='FECHA_ACTUALIZACION', blank=True, null=True)
 
     class Meta:
         managed = True
@@ -109,4 +110,4 @@ class SicreTblSig(models.Model):
         verbose_name_plural = 'SICRE-SIG'
 
     def __str__(self):
-        return f"{self.rfc} - {self.nombre}"
+        return f"{self.empleado_anam} - {self.nombres}"
