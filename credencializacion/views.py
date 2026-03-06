@@ -1,12 +1,12 @@
 # enrolamiento/views.py
 from rest_framework import viewsets, filters, status
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar
 from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer
 from django.db.models import Q, Count, Min
-from django.db import models, transaction
+from django.db import models, transaction, connection
 from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
@@ -20,9 +20,71 @@ from io import BytesIO
 from django.utils import timezone
 
 
+def _cargo_a_nivel(cargo: str) -> str:
+    """
+    Determina el nivel de credencial (nivel_credencial) a partir del campo CARGO/PUESTO.
+    Niveles válidos:
+        TITULAR, DIRECTOR_GENERAL, DIRECTOR_CENTRAL, DIRECTOR_DE_AREA,
+        SUBDIRECTOR, JEFE_DE_DEPARTAMENTO, ENLACE, SEGURIDAD_INSTITUCIONAL
+    """
+    if not cargo:
+        return 'ENLACE'
+    c = str(cargo).strip().upper()
+
+    if 'DIRECTOR GENERAL' in c or 'ADMINISTRADOR GENERAL' in c or 'TITULAR' in c:
+        return 'TITULAR'
+    if 'DIRECTOR CENTRAL' in c:
+        return 'DIRECTOR_CENTRAL'
+    if c.startswith('DIRECTOR DE AREA') or c.startswith('DIRECTOR DE ÁREA'):
+        return 'DIRECTOR_DE_AREA'
+    if c.startswith('DIRECTOR'):
+        return 'DIRECTOR_DE_AREA'
+    if 'SUBDIRECTOR' in c:
+        return 'SUBDIRECTOR'
+    if 'JEFE DE DEPARTAMENTO' in c or 'JEFE DEL DEPARTAMENTO' in c:
+        return 'JEFE_DE_DEPARTAMENTO'
+    if 'ENLACE' in c:
+        return 'ENLACE'
+    if 'OPERATIVO' in c or 'SEGURIDAD INSTITUCIONAL' in c or 'SEGURIDAD_INSTITUCIONAL' in c:
+        return 'SEGURIDAD_INSTITUCIONAL'
+    return 'ENLACE'
+
+
 def extraer_imagenes_de_excel(archivo):
     """
     Versión 5.0 (Final): Soporte DUAL para FOTOS (Col L) y FIRMAS (Col M).
+    Wrapper que delega en extraer_imagenes_de_excel_real.
+    """
+    return extraer_imagenes_de_excel_real(archivo)
+
+
+def _get_num_empleados_con_foto_firma():
+    """
+    Devuelve un set de valores de num_empleado que ya tienen FOTO y FIRMA
+    en safirho_db.NW_EMPL_FOTO_ANAM (en todas sus variantes de formato).
+    """
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EMPLID FROM safirho_db.NW_EMPL_FOTO_ANAM
+                WHERE FOTO IS NOT NULL AND LENGTH(FOTO) > 1
+                  AND FIRMA IS NOT NULL AND LENGTH(FIRMA) > 1
+                """
+            )
+            rows = cursor.fetchall()
+        result = set()
+        for (emplid,) in rows:
+            emplid_str = str(emplid).strip()
+            result.add(emplid_str)                          # original  (00020232019)
+            result.add(emplid_str.lstrip('0') or '0')      # sin ceros  (20232019)
+        return result
+    except Exception:
+        return set()
+
+
+def extraer_imagenes_de_excel_real(archivo):
+    """\n    Versión 5.0 (Final): Soporte DUAL para FOTOS (Col L) y FIRMAS (Col M).
     Mantiene el nombre original para compatibilidad.
     """
     from openpyxl import load_workbook
@@ -328,14 +390,29 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         """
         Endpoint para alimentar la data table del front.
         Columnas: Num Empleado, RFC, CURP, nombres, adscripcion, puesto.
-        Filtros: foto y firma no nulos, y que no estén marcados como impresos (impreso != 1).
+        Filtros: foto y firma no nulos (incluyendo flag 1 o registro en NW_EMPL_FOTO_ANAM),
+        y que no estén marcados como impresos (impreso != 1).
         """
+        completos = _get_num_empleados_con_foto_firma()
+
         queryset = self.get_queryset().exclude(
             Q(foto__isnull=True) | Q(foto=b'') |
-            Q(firma__isnull=True) | Q(firma=b'') 
+            Q(firma__isnull=True) | Q(firma=b'')
         ).filter(
             Q(impreso__isnull=True) | Q(impreso=0) | ~Q(impreso=1)
         )
+
+        # También incluir empleados con foto+firma en NW_EMPL_FOTO_ANAM
+        if completos:
+            qs_externos = self.get_queryset().filter(
+                num_empleado__in=completos
+            ).filter(
+                Q(impreso__isnull=True) | Q(impreso=0) | ~Q(impreso=1)
+            )
+            from itertools import chain
+            queryset = list(chain(queryset, qs_externos.exclude(pk__in=queryset.values_list('pk', flat=True))))
+        else:
+            queryset = list(queryset)
 
         queryset_familiares = EnrolamientoFamiliar.objects.exclude(
             Q(foto__isnull=True) | Q(foto=b'') |
@@ -381,15 +458,19 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def pendientes(self, request):
         """
-        Muestra solo los registros que faltan de foto O firma.
-        Una vez que ambos campos tengan datos, el registro dejará de salir en esta lista.
+        Muestra solo los registros que faltan de foto O firma,
+        y que adicionalmente NO tienen ambas en safirho_db.NW_EMPL_FOTO_ANAM.
         """
-        # Filtramos donde foto es nula/vacía O firma es nula/vacía
+        completos = _get_num_empleados_con_foto_firma()
+
         queryset = self.get_queryset().filter(
-            Q(foto__isnull=True) | Q(foto=b'') | 
+            Q(foto__isnull=True) | Q(foto=b'') |
             Q(firma__isnull=True) | Q(firma=b'')
         )
-        
+
+        if completos:
+            queryset = queryset.exclude(num_empleado__in=completos)
+
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
@@ -522,41 +603,70 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                 'status': 'error',
                 'mensaje': f'Error al obtener folio máximo: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
-    @action(detail=True, methods=['post'], url_path='marcar-impreso')
-    def marcar_impreso(self, request, pk=None):
-        """
-        Marca un registro como impreso (impreso = 1) y actualiza la fecha de expedición.
-        Se llama después de generar exitosamente el PDF de la credencial.
-        """
-        try:
-            enrolamiento = self.get_object()
-            
-            # Marcar como impreso y conservar la fecha de expedición original en reimpresiones.
-            enrolamiento.impreso = 1
-            fecha_expedicion_payload = request.data.get('fecha_expedicion')
 
-            if not enrolamiento.fecha_expedicion:
-                enrolamiento.fecha_expedicion = fecha_expedicion_payload or timezone.now().date()
-            enrolamiento.save()
-            
-            return Response({
-                'status': 'success',
-                'mensaje': f'Credencial {enrolamiento.folio or enrolamiento.id_enrolamiento} marcada como impresa',
-                'data': {
-                    'id_enrolamiento': enrolamiento.id_enrolamiento,
-                    'folio': enrolamiento.folio,
-                    'impreso': enrolamiento.impreso,
-                    'fecha_expedicion': enrolamiento.fecha_expedicion
-                }
-            }, status=status.HTTP_200_OK)
-            
+    @action(detail=True, methods=['post'], url_path='guardar-foto-firma')
+    def guardar_foto_firma(self, request, pk=None):
+        """
+        Guarda foto y firma en safirho_db.NW_EMPL_FOTO_ANAM (INSERT o UPDATE).
+        Marca enrolamiento.foto y enrolamiento.firma con flag b'\\x01' para excluirlo
+        del endpoint pendientes sin guardar el blob en sicre_db.
+        """
+        enrolamiento = self.get_object()
+        foto_b64 = request.data.get('foto')
+        firma_b64 = request.data.get('firma')
+
+        if not foto_b64 or not firma_b64:
+            return Response({'status': 'error', 'mensaje': 'Faltan foto o firma'}, status=400)
+
+        def clean_b64(data):
+            if isinstance(data, str) and 'base64,' in data:
+                data = data.split('base64,')[1]
+            return base64.b64decode(data)
+
+        try:
+            foto_bytes = clean_b64(foto_b64)
+            firma_bytes = clean_b64(firma_b64)
         except Exception as e:
-            return Response({
-                'status': 'error',
-                'mensaje': f'Error al marcar como impreso: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
+            return Response({'status': 'error', 'mensaje': f'Error al decodificar imagen: {e}'}, status=400)
+
+        emplid = str(enrolamiento.num_empleado or '').strip()
+        if not emplid:
+            return Response({'status': 'error', 'mensaje': 'El empleado no tiene número de empleado'}, status=400)
+
+        emplid_padded = emplid.zfill(11)
+        emplid_stripped = emplid.lstrip('0') or '0'
+        variantes = list({emplid, emplid_padded, emplid_stripped})
+        placeholders = ','.join(['%s'] * len(variantes))
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT EMPLID FROM safirho_db.NW_EMPL_FOTO_ANAM WHERE EMPLID IN ({placeholders}) LIMIT 1",
+                    variantes
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute(
+                        "UPDATE safirho_db.NW_EMPL_FOTO_ANAM "
+                        "SET FOTO=%s, FIRMA=%s, TipoMime='image/jpeg', updated_at=NOW() "
+                        "WHERE EMPLID=%s",
+                        [foto_bytes, firma_bytes, existing[0]]
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT INTO safirho_db.NW_EMPL_FOTO_ANAM "
+                        "(EMPLID, FOTO, FIRMA, TipoMime, updated_at) VALUES (%s, %s, %s, 'image/jpeg', NOW())",
+                        [emplid_padded, foto_bytes, firma_bytes]
+                    )
+        except Exception as e:
+            return Response({'status': 'error', 'mensaje': f'Error al guardar en BD externa: {e}'}, status=500)
+
+        enrolamiento.foto = b'\x01'
+        enrolamiento.firma = b'\x01'
+        enrolamiento.save(update_fields=['foto', 'firma'])
+
+        return Response({'status': 'success', 'mensaje': 'Foto y firma guardadas correctamente'})
+
     @action(detail=False, methods=['get', 'post'], url_path='busqueda-avanzada')
     def busqueda_avanzada(self, request):
         """
@@ -1287,6 +1397,7 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                         'puesto': row.get('cargo'),
                         'adscripcion': row.get('area'),
                         'activo': activo_flag,
+                        'nivel_credencial': _cargo_a_nivel(row.get('cargo') or ''),
                     }
 
                     for field_name, new_value in enr_new_values.items():
@@ -1311,7 +1422,8 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                         puesto=row.get('cargo'),
                         adscripcion=row.get('area'),
                         activo=activo_flag,
-                        fecha_enrolamiento=timezone.now()
+                        fecha_enrolamiento=timezone.now(),
+                        nivel_credencial=_cargo_a_nivel(row.get('cargo') or '')
                     ))
 
             sig_update = list({obj.empleado_anam: obj for obj in sig_update}.values())
@@ -1346,7 +1458,7 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                 if enr_update:
                     Enrolamiento.objects.bulk_update(
                         enr_update,
-                        ['rfc', 'num_empleado', 'nombre', 'paterno', 'materno', 'apellidos', 'puesto', 'adscripcion', 'activo', 'fecha_modificacion'],
+                        ['rfc', 'num_empleado', 'nombre', 'paterno', 'materno', 'apellidos', 'puesto', 'adscripcion', 'activo', 'nivel_credencial', 'fecha_modificacion'],
                         batch_size=1000
                     )
 
@@ -1460,3 +1572,53 @@ class CustomLoginView(APIView):
                 }, status=status.HTTP_200_OK) 
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET'])
+def foto_firma_empleado(request, emplid):
+    """
+    Obtiene foto y firma de safirho_db.NW_EMPL_FOTO_ANAM para un EMPLID dado.
+    Prueba con el valor tal cual, zero-padded a 11 dígitos y sin ceros a la izquierda.
+    """
+    emplid_str = str(emplid).strip()
+    emplid_padded = emplid_str.zfill(11)
+    emplid_stripped = emplid_str.lstrip('0') or '0'
+
+    variantes = list({emplid_str, emplid_padded, emplid_stripped})
+    placeholders = ','.join(['%s'] * len(variantes))
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT FOTO, FIRMA, TipoMime FROM safirho_db.NW_EMPL_FOTO_ANAM WHERE EMPLID IN ({placeholders}) LIMIT 1",
+                variantes
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return Response({'foto': None, 'firma': None, 'encontrado': False})
+
+        foto_raw, firma_raw, tipo_mime = row
+        mime = tipo_mime or 'image/jpeg'
+
+        def blob_to_b64(raw):
+            if raw is None:
+                return None
+            if isinstance(raw, memoryview):
+                raw = bytes(raw)
+            elif isinstance(raw, bytearray):
+                raw = bytes(raw)
+            elif not isinstance(raw, bytes):
+                raw = bytes(raw)
+            if not raw:
+                return None
+            return f'data:{mime};base64,' + base64.b64encode(raw).decode('utf-8')
+
+        return Response({
+            'foto': blob_to_b64(foto_raw),
+            'firma': blob_to_b64(firma_raw),
+            'encontrado': True,
+        })
+
+    except Exception as e:
+        return Response({'foto': None, 'firma': None, 'encontrado': False, 'error': str(e)}, status=200)

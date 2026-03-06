@@ -17,7 +17,7 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from credencializacion.views import EnrolamientoViewSet, SigViewSet, CustomLoginView, EnrolamientoFamiliarViewSet
+from credencializacion.views import EnrolamientoViewSet, SigViewSet, CustomLoginView, EnrolamientoFamiliarViewSet, foto_firma_empleado
 
 
 router = DefaultRouter()
@@ -30,4 +30,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include(router.urls)),
     path('api/login/', CustomLoginView.as_view(), name='api_login'),
+    path('api/foto-firma/<str:emplid>/', foto_firma_empleado, name='foto_firma_empleado'),
 ]

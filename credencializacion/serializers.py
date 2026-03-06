@@ -39,6 +39,9 @@ class Base64BinaryField(serializers.Field):
     def to_representation(self, value):
         if not value:
             return None
+        # Flag byte: foto/firma externalizada a safirho_db.NW_EMPL_FOTO_ANAM
+        if len(value) <= 2:
+            return '1'
         try:
             # Detectar el tipo de imagen
             image_type = detectar_tipo_imagen(value)
