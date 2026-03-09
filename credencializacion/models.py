@@ -31,6 +31,7 @@ class Enrolamiento(models.Model):
     activo = models.IntegerField(blank=True, null=True)
     nuevo_laredo = models.IntegerField(blank=True, null=True)
     nivel_credencial = models.CharField(max_length=50, blank=True, null=True)
+    layout_credencial = models.CharField(max_length=30, blank=True, null=True)
 
     class Meta:
         managed = True

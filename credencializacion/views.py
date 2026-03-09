@@ -430,10 +430,8 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             registro['source_table'] = 'enrolamiento'
             if int(registro.get('nuevo_laredo') or 0) == 1:
                 registro['tipo_credencial'] = 'provisional'
-            elif int(registro.get('provisional') or 0) == 1:
-                registro['tipo_credencial'] = 'anam'
             else:
-                registro['tipo_credencial'] = 'enrolamiento'
+                registro['tipo_credencial'] = 'anam'
             data_enrolamiento.append(registro)
 
         data_familiares = []
@@ -1398,6 +1396,7 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                         'adscripcion': row.get('area'),
                         'activo': activo_flag,
                         'nivel_credencial': _cargo_a_nivel(row.get('cargo') or ''),
+                        'layout_credencial': 'ANAM_2025',
                     }
 
                     for field_name, new_value in enr_new_values.items():
@@ -1423,7 +1422,8 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                         adscripcion=row.get('area'),
                         activo=activo_flag,
                         fecha_enrolamiento=timezone.now(),
-                        nivel_credencial=_cargo_a_nivel(row.get('cargo') or '')
+                        nivel_credencial=_cargo_a_nivel(row.get('cargo') or ''),
+                        layout_credencial='ANAM_2025'
                     ))
 
             sig_update = list({obj.empleado_anam: obj for obj in sig_update}.values())
@@ -1458,7 +1458,7 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                 if enr_update:
                     Enrolamiento.objects.bulk_update(
                         enr_update,
-                        ['rfc', 'num_empleado', 'nombre', 'paterno', 'materno', 'apellidos', 'puesto', 'adscripcion', 'activo', 'nivel_credencial', 'fecha_modificacion'],
+                        ['rfc', 'num_empleado', 'nombre', 'paterno', 'materno', 'apellidos', 'puesto', 'adscripcion', 'activo', 'nivel_credencial', 'layout_credencial', 'fecha_modificacion'],
                         batch_size=1000
                     )
 
