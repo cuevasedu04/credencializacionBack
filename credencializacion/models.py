@@ -66,6 +66,7 @@ class EnrolamientoFamiliar(models.Model):
     impreso = models.IntegerField(blank=True, null=True)
     fecha_expedicion = models.DateField(blank=True, null=True)
     provisional = models.IntegerField(db_column='provisional', blank=True, null=True)
+    nombre_reverso = models.CharField(max_length=200, blank=True, null=True)
     vivienda = models.CharField(max_length=100, blank=True, null=True)
     marca = models.CharField(max_length=100, blank=True, null=True)
     color = models.CharField(max_length=100, blank=True, null=True)
