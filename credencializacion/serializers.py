@@ -112,33 +112,7 @@ class EnrolamientoFamiliarSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = EnrolamientoFamiliar
-        fields = [
-            'id_enrolamiento',
-            'num_empleado',
-            'rfc',
-            'curp',
-            'nombre',
-            'paterno',
-            'materno',
-            'apellidos',
-            'puesto',
-            'adscripcion',
-            'inicio_vig',
-            'fin_vig',
-            'eladia',
-            'foto',
-            'firma',
-            'folio_familiares',
-            'impreso',
-            'fecha_expedicion',
-            'id_usuario_registra',
-            'fecha_registro',
-            'fecha_enrolamiento',
-            'id_usuario_modifica',
-            'fecha_modificacion',
-            'ultima_carga',
-            'activo',
-        ]
+        fields = '__all__'
 
 
 class SigSerializer(serializers.ModelSerializer):
