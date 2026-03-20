@@ -665,6 +665,304 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
 
         return Response({'status': 'success', 'mensaje': 'Foto y firma guardadas correctamente'})
 
+    @action(detail=False, methods=['get', 'post'], url_path='pendientes-de-imprimir')
+    def pendientes_de_imprimir(self, request):
+        """
+        Endpoint de bÃºsqueda avanzada para ag-grid.
+        Permite filtrar por mÃºltiples campos y retorna todos los detalles.
+        Soporta filtros por: num_empleado, rfc, curp, nombre, paterno, materno,
+        puesto, adscripcion, folio, impreso, fecha_expedicion_desde, fecha_expedicion_hasta.
+        """
+        queryset = self.get_queryset().filter(fecha_expedicion__isnull=False).filter(Q(impreso=0) | Q(impreso__isnull=True))
+        queryset_familiares = EnrolamientoFamiliar.objects.filter(fecha_expedicion__isnull=False).filter(Q(impreso=0) | Q(impreso__isnull=True)).order_by('-id_enrolamiento')
+        
+        # Obtener parÃ¡metros de filtro (soporta GET y POST)
+        params = request.query_params if request.method == 'GET' else request.data
+        
+        # Filtros de texto
+        if params.get('num_empleado'):
+            queryset = queryset.filter(num_empleado__icontains=params['num_empleado'])
+            queryset_familiares = queryset_familiares.filter(num_empleado__icontains=params['num_empleado'])
+        
+        if params.get('rfc'):
+            queryset = queryset.filter(rfc__icontains=params['rfc'])
+            queryset_familiares = queryset_familiares.filter(rfc__icontains=params['rfc'])
+        
+        if params.get('curp'):
+            queryset = queryset.filter(curp__icontains=params['curp'])
+            queryset_familiares = queryset_familiares.filter(curp__icontains=params['curp'])
+        
+        if params.get('nombre'):
+            queryset = queryset.filter(nombre__icontains=params['nombre'])
+            queryset_familiares = queryset_familiares.filter(nombre__icontains=params['nombre'])
+        
+        if params.get('paterno'):
+            queryset = queryset.filter(paterno__icontains=params['paterno'])
+            queryset_familiares = queryset_familiares.filter(paterno__icontains=params['paterno'])
+        
+        if params.get('materno'):
+            queryset = queryset.filter(materno__icontains=params['materno'])
+            queryset_familiares = queryset_familiares.filter(materno__icontains=params['materno'])
+        
+        if params.get('puesto'):
+            queryset = queryset.filter(puesto__icontains=params['puesto'])
+            queryset_familiares = queryset_familiares.filter(puesto__icontains=params['puesto'])
+        
+        if params.get('adscripcion'):
+            queryset = queryset.filter(adscripcion__icontains=params['adscripcion'])
+            queryset_familiares = queryset_familiares.filter(adscripcion__icontains=params['adscripcion'])
+        
+        if params.get('folio'):
+            queryset = queryset.filter(folio__icontains=params['folio'])
+            queryset_familiares = queryset_familiares.filter(folio_familiares__icontains=params['folio'])
+        
+        # Filtro por estado de impresiÃ³n
+        if params.get('impreso') is not None:
+            impreso_val = params['impreso']
+            if impreso_val == '1' or impreso_val == 1:
+                queryset = queryset.filter(impreso=1)
+                queryset_familiares = queryset_familiares.filter(impreso=1)
+            elif impreso_val == '0' or impreso_val == 0:
+                queryset = queryset.filter(Q(impreso=0) | Q(impreso__isnull=True))
+                queryset_familiares = queryset_familiares.filter(Q(impreso=0) | Q(impreso__isnull=True))
+        
+        # Filtros por rango de fechas de expediciÃ³n
+        if params.get('fecha_expedicion_desde'):
+            queryset = queryset.filter(fecha_expedicion__gte=params['fecha_expedicion_desde'])
+            queryset_familiares = queryset_familiares.filter(fecha_expedicion__gte=params['fecha_expedicion_desde'])
+        
+        if params.get('fecha_expedicion_hasta'):
+            queryset = queryset.filter(fecha_expedicion__lte=params['fecha_expedicion_hasta'])
+            queryset_familiares = queryset_familiares.filter(fecha_expedicion__lte=params['fecha_expedicion_hasta'])
+        
+        # Filtros por rango de fechas de vigencia
+        if params.get('inicio_vig_desde'):
+            queryset = queryset.filter(inicio_vig__gte=params['inicio_vig_desde'])
+            queryset_familiares = queryset_familiares.filter(inicio_vig__gte=params['inicio_vig_desde'])
+        
+        if params.get('fin_vig_hasta'):
+            queryset = queryset.filter(fin_vig__lte=params['fin_vig_hasta'])
+            queryset_familiares = queryset_familiares.filter(fin_vig__lte=params['fin_vig_hasta'])
+        
+        # Filtros por fecha de registro
+        if params.get('fecha_registro_desde'):
+            queryset = queryset.filter(fecha_registro__date__gte=params['fecha_registro_desde'])
+            queryset_familiares = queryset_familiares.filter(fecha_registro__date__gte=params['fecha_registro_desde'])
+        
+        if params.get('fecha_registro_hasta'):
+            queryset = queryset.filter(fecha_registro__date__lte=params['fecha_registro_hasta'])
+            queryset_familiares = queryset_familiares.filter(fecha_registro__date__lte=params['fecha_registro_hasta'])
+        
+        # Filtro por fecha de registro especÃ­fica
+        if params.get('fecha_registro'):
+            queryset = queryset.filter(fecha_registro__date=params['fecha_registro'])
+            queryset_familiares = queryset_familiares.filter(fecha_registro__date=params['fecha_registro'])
+        
+        # Filtro por fecha de expediciÃ³n especÃ­fica
+        if params.get('fecha_expedicion'):
+            queryset = queryset.filter(fecha_expedicion=params['fecha_expedicion'])
+            queryset_familiares = queryset_familiares.filter(fecha_expedicion=params['fecha_expedicion'])
+        
+        # Filtro por estado de completitud (con foto y firma)
+        if params.get('solo_completos') == 'true' or params.get('solo_completos') == True:
+            queryset = queryset.exclude(
+                Q(foto__isnull=True) | Q(foto=b'') |
+                Q(firma__isnull=True) | Q(firma=b'')
+            )
+            queryset_familiares = queryset_familiares.exclude(
+                Q(foto__isnull=True) | Q(foto=b'') |
+                Q(firma__isnull=True) | Q(firma=b'')
+            )
+        
+        # Filtro por registros activos
+        if params.get('solo_activos') == 'true' or params.get('solo_activos') == True:
+            queryset = queryset.filter(activo=1)
+            queryset_familiares = queryset_familiares.filter(activo=1)
+
+        serializer_enrolamiento = self.get_serializer(queryset, many=True)
+        serializer_familiar = EnrolamientoFamiliarSerializer(queryset_familiares, many=True)
+
+        data_enrolamiento = []
+        for item in serializer_enrolamiento.data:
+            registro = dict(item)
+            registro['source_table'] = 'enrolamiento'
+            if int(registro.get('nuevo_laredo') or 0) == 1:
+                registro['tipo_credencial'] = 'provisional'
+            elif int(registro.get('provisional') or 0) == 1:
+                registro['tipo_credencial'] = 'anam'
+            else:
+                registro['tipo_credencial'] = 'enrolamiento'
+            data_enrolamiento.append(registro)
+
+        data_familiares = []
+        for item in serializer_familiar.data:
+            registro = dict(item)
+            registro['source_table'] = 'familiar'
+            registro['tipo_credencial'] = 'familiar'
+            registro['folio'] = registro.get('folio_familiares')
+            data_familiares.append(registro)
+
+        data = sorted(
+            data_enrolamiento + data_familiares,
+            key=lambda x: x.get('fecha_registro') or x.get('fecha_enrolamiento') or '',
+            reverse=True
+        )
+
+        page = self.paginate_queryset(data)
+        if page is not None:
+            return self.get_paginated_response(page)
+
+        return Response(data)
+
+    @action(detail=False, methods=['get', 'post'], url_path='pendientes-de-imprimir')
+    def pendientes_de_imprimir(self, request):
+        """
+        Endpoint de bÃºsqueda avanzada para ag-grid.
+        Permite filtrar por mÃºltiples campos y retorna todos los detalles.
+        Soporta filtros por: num_empleado, rfc, curp, nombre, paterno, materno,
+        puesto, adscripcion, folio, impreso, fecha_expedicion_desde, fecha_expedicion_hasta.
+        """
+        queryset = self.get_queryset().filter(fecha_expedicion__isnull=False).filter(Q(impreso=0) | Q(impreso__isnull=True))
+        queryset_familiares = EnrolamientoFamiliar.objects.filter(fecha_expedicion__isnull=False).filter(Q(impreso=0) | Q(impreso__isnull=True)).order_by('-id_enrolamiento')
+        
+        # Obtener parÃ¡metros de filtro (soporta GET y POST)
+        params = request.query_params if request.method == 'GET' else request.data
+        
+        # Filtros de texto
+        if params.get('num_empleado'):
+            queryset = queryset.filter(num_empleado__icontains=params['num_empleado'])
+            queryset_familiares = queryset_familiares.filter(num_empleado__icontains=params['num_empleado'])
+        
+        if params.get('rfc'):
+            queryset = queryset.filter(rfc__icontains=params['rfc'])
+            queryset_familiares = queryset_familiares.filter(rfc__icontains=params['rfc'])
+        
+        if params.get('curp'):
+            queryset = queryset.filter(curp__icontains=params['curp'])
+            queryset_familiares = queryset_familiares.filter(curp__icontains=params['curp'])
+        
+        if params.get('nombre'):
+            queryset = queryset.filter(nombre__icontains=params['nombre'])
+            queryset_familiares = queryset_familiares.filter(nombre__icontains=params['nombre'])
+        
+        if params.get('paterno'):
+            queryset = queryset.filter(paterno__icontains=params['paterno'])
+            queryset_familiares = queryset_familiares.filter(paterno__icontains=params['paterno'])
+        
+        if params.get('materno'):
+            queryset = queryset.filter(materno__icontains=params['materno'])
+            queryset_familiares = queryset_familiares.filter(materno__icontains=params['materno'])
+        
+        if params.get('puesto'):
+            queryset = queryset.filter(puesto__icontains=params['puesto'])
+            queryset_familiares = queryset_familiares.filter(puesto__icontains=params['puesto'])
+        
+        if params.get('adscripcion'):
+            queryset = queryset.filter(adscripcion__icontains=params['adscripcion'])
+            queryset_familiares = queryset_familiares.filter(adscripcion__icontains=params['adscripcion'])
+        
+        if params.get('folio'):
+            queryset = queryset.filter(folio__icontains=params['folio'])
+            queryset_familiares = queryset_familiares.filter(folio_familiares__icontains=params['folio'])
+        
+        # Filtro por estado de impresiÃ³n
+        if params.get('impreso') is not None:
+            impreso_val = params['impreso']
+            if impreso_val == '1' or impreso_val == 1:
+                queryset = queryset.filter(impreso=1)
+                queryset_familiares = queryset_familiares.filter(impreso=1)
+            elif impreso_val == '0' or impreso_val == 0:
+                queryset = queryset.filter(Q(impreso=0) | Q(impreso__isnull=True))
+                queryset_familiares = queryset_familiares.filter(Q(impreso=0) | Q(impreso__isnull=True))
+        
+        # Filtros por rango de fechas de expediciÃ³n
+        if params.get('fecha_expedicion_desde'):
+            queryset = queryset.filter(fecha_expedicion__gte=params['fecha_expedicion_desde'])
+            queryset_familiares = queryset_familiares.filter(fecha_expedicion__gte=params['fecha_expedicion_desde'])
+        
+        if params.get('fecha_expedicion_hasta'):
+            queryset = queryset.filter(fecha_expedicion__lte=params['fecha_expedicion_hasta'])
+            queryset_familiares = queryset_familiares.filter(fecha_expedicion__lte=params['fecha_expedicion_hasta'])
+        
+        # Filtros por rango de fechas de vigencia
+        if params.get('inicio_vig_desde'):
+            queryset = queryset.filter(inicio_vig__gte=params['inicio_vig_desde'])
+            queryset_familiares = queryset_familiares.filter(inicio_vig__gte=params['inicio_vig_desde'])
+        
+        if params.get('fin_vig_hasta'):
+            queryset = queryset.filter(fin_vig__lte=params['fin_vig_hasta'])
+            queryset_familiares = queryset_familiares.filter(fin_vig__lte=params['fin_vig_hasta'])
+        
+        # Filtros por fecha de registro
+        if params.get('fecha_registro_desde'):
+            queryset = queryset.filter(fecha_registro__date__gte=params['fecha_registro_desde'])
+            queryset_familiares = queryset_familiares.filter(fecha_registro__date__gte=params['fecha_registro_desde'])
+        
+        if params.get('fecha_registro_hasta'):
+            queryset = queryset.filter(fecha_registro__date__lte=params['fecha_registro_hasta'])
+            queryset_familiares = queryset_familiares.filter(fecha_registro__date__lte=params['fecha_registro_hasta'])
+        
+        # Filtro por fecha de registro especÃ­fica
+        if params.get('fecha_registro'):
+            queryset = queryset.filter(fecha_registro__date=params['fecha_registro'])
+            queryset_familiares = queryset_familiares.filter(fecha_registro__date=params['fecha_registro'])
+        
+        # Filtro por fecha de expediciÃ³n especÃ­fica
+        if params.get('fecha_expedicion'):
+            queryset = queryset.filter(fecha_expedicion=params['fecha_expedicion'])
+            queryset_familiares = queryset_familiares.filter(fecha_expedicion=params['fecha_expedicion'])
+        
+        # Filtro por estado de completitud (con foto y firma)
+        if params.get('solo_completos') == 'true' or params.get('solo_completos') == True:
+            queryset = queryset.exclude(
+                Q(foto__isnull=True) | Q(foto=b'') |
+                Q(firma__isnull=True) | Q(firma=b'')
+            )
+            queryset_familiares = queryset_familiares.exclude(
+                Q(foto__isnull=True) | Q(foto=b'') |
+                Q(firma__isnull=True) | Q(firma=b'')
+            )
+        
+        # Filtro por registros activos
+        if params.get('solo_activos') == 'true' or params.get('solo_activos') == True:
+            queryset = queryset.filter(activo=1)
+            queryset_familiares = queryset_familiares.filter(activo=1)
+
+        serializer_enrolamiento = self.get_serializer(queryset, many=True)
+        serializer_familiar = EnrolamientoFamiliarSerializer(queryset_familiares, many=True)
+
+        data_enrolamiento = []
+        for item in serializer_enrolamiento.data:
+            registro = dict(item)
+            registro['source_table'] = 'enrolamiento'
+            if int(registro.get('nuevo_laredo') or 0) == 1:
+                registro['tipo_credencial'] = 'provisional'
+            elif int(registro.get('provisional') or 0) == 1:
+                registro['tipo_credencial'] = 'anam'
+            else:
+                registro['tipo_credencial'] = 'enrolamiento'
+            data_enrolamiento.append(registro)
+
+        data_familiares = []
+        for item in serializer_familiar.data:
+            registro = dict(item)
+            registro['source_table'] = 'familiar'
+            registro['tipo_credencial'] = 'familiar'
+            registro['folio'] = registro.get('folio_familiares')
+            data_familiares.append(registro)
+
+        data = sorted(
+            data_enrolamiento + data_familiares,
+            key=lambda x: x.get('fecha_registro') or x.get('fecha_enrolamiento') or '',
+            reverse=True
+        )
+
+        page = self.paginate_queryset(data)
+        if page is not None:
+            return self.get_paginated_response(page)
+
+        return Response(data)
+
     @action(detail=False, methods=['get', 'post'], url_path='busqueda-avanzada')
     def busqueda_avanzada(self, request):
         """
