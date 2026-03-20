@@ -1,4 +1,4 @@
-# enrolamiento/views.py
+﻿# enrolamiento/views.py
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
@@ -23,7 +23,7 @@ from django.utils import timezone
 def _cargo_a_nivel(cargo: str) -> str:
     """
     Determina el nivel de credencial (nivel_credencial) a partir del campo CARGO/PUESTO.
-    Niveles válidos:
+    Niveles vÃ¡lidos:
         TITULAR, DIRECTOR_GENERAL, DIRECTOR_CENTRAL, DIRECTOR_DE_AREA,
         SUBDIRECTOR, JEFE_DE_DEPARTAMENTO, ENLACE, SEGURIDAD_INSTITUCIONAL
     """
@@ -35,7 +35,7 @@ def _cargo_a_nivel(cargo: str) -> str:
         return 'TITULAR'
     if 'DIRECTOR CENTRAL' in c:
         return 'DIRECTOR_CENTRAL'
-    if c.startswith('DIRECTOR DE AREA') or c.startswith('DIRECTOR DE ÁREA'):
+    if c.startswith('DIRECTOR DE AREA') or c.startswith('DIRECTOR DE ÃREA'):
         return 'DIRECTOR_DE_AREA'
     if c.startswith('DIRECTOR'):
         return 'DIRECTOR_DE_AREA'
@@ -52,7 +52,7 @@ def _cargo_a_nivel(cargo: str) -> str:
 
 def extraer_imagenes_de_excel(archivo):
     """
-    Versión 5.0 (Final): Soporte DUAL para FOTOS (Col L) y FIRMAS (Col M).
+    VersiÃ³n 5.0 (Final): Soporte DUAL para FOTOS (Col L) y FIRMAS (Col M).
     Wrapper que delega en extraer_imagenes_de_excel_real.
     """
     return extraer_imagenes_de_excel_real(archivo)
@@ -84,7 +84,7 @@ def _get_num_empleados_con_foto_firma():
 
 
 def extraer_imagenes_de_excel_real(archivo):
-    """\n    Versión 5.0 (Final): Soporte DUAL para FOTOS (Col L) y FIRMAS (Col M).
+    """\n    VersiÃ³n 5.0 (Final): Soporte DUAL para FOTOS (Col L) y FIRMAS (Col M).
     Mantiene el nombre original para compatibilidad.
     """
     from openpyxl import load_workbook
@@ -93,24 +93,24 @@ def extraer_imagenes_de_excel_real(archivo):
     import posixpath
     import xml.etree.ElementTree as ET
     
-    print(f"--- INICIANDO EXTRACCIÓN DUAL: {archivo} ---")
+    print(f"--- INICIANDO EXTRACCIÃ“N DUAL: {archivo} ---")
     fotos_por_fila = {}
     firmas_por_fila = {}
     
-    # --- INTENTO 1: MÉTODO ESTÁNDAR (OpenPyXL) ---
+    # --- INTENTO 1: MÃ‰TODO ESTÃNDAR (OpenPyXL) ---
     try:
         if hasattr(archivo, 'seek'): archivo.seek(0)
-        # data_only=False es vital para ver las imágenes
+        # data_only=False es vital para ver las imÃ¡genes
         wb = load_workbook(archivo, data_only=False)
         ws = wb.active
         
         imagenes = getattr(ws, '_images', []) or getattr(ws, 'images', [])
-        print(f"   -> Método Estándar detectó: {len(imagenes)} imágenes")
+        print(f"   -> MÃ©todo EstÃ¡ndar detectÃ³: {len(imagenes)} imÃ¡genes")
 
         for image in imagenes:
             try:
                 # Coordenadas (Excel base 1)
-                # .anchor._from.row es índice 0, por eso sumamos 1
+                # .anchor._from.row es Ã­ndice 0, por eso sumamos 1
                 row = image.anchor._from.row + 1
                 col = image.anchor._from.col + 1 
                 
@@ -124,7 +124,7 @@ def extraer_imagenes_de_excel_real(archivo):
                     img_bytes = buf.getvalue()
                 
                 if img_bytes:
-                    # Lógica de Columnas: 
+                    # LÃ³gica de Columnas: 
                     # Columna 12 = L (Foto)
                     # Columna 13 = M (Firma)
                     if col == 12: 
@@ -133,17 +133,17 @@ def extraer_imagenes_de_excel_real(archivo):
                         firmas_por_fila[row] = img_bytes
                         
             except Exception as e:
-                print(f"   -> Error leyendo imagen estándar: {e}")
+                print(f"   -> Error leyendo imagen estÃ¡ndar: {e}")
         
         wb.close()
     except Exception as e:
-        print(f"   -> Falló método estándar: {e}")
+        print(f"   -> FallÃ³ mÃ©todo estÃ¡ndar: {e}")
 
     # --- INTENTO 2: PLAN B ROBUSTO (ZIP + DRAWING RELS) ---
-    # Si el método estándar falló y no detectó NADA, resolvemos anclas reales
-    # desde drawing.xml y sus relaciones (NO por orden alfabético de archivos).
+    # Si el mÃ©todo estÃ¡ndar fallÃ³ y no detectÃ³ NADA, resolvemos anclas reales
+    # desde drawing.xml y sus relaciones (NO por orden alfabÃ©tico de archivos).
     if not fotos_por_fila and not firmas_por_fila:
-        print("⚠️ ACTIVANDO EXTRACCIÓN ROBUSTA DUAL (PLAN B ZIP + RELS)")
+        print("âš ï¸ ACTIVANDO EXTRACCIÃ“N ROBUSTA DUAL (PLAN B ZIP + RELS)")
         try:
             if hasattr(archivo, 'seek'): archivo.seek(0)
             if zipfile.is_zipfile(archivo):
@@ -170,7 +170,7 @@ def extraer_imagenes_de_excel_real(archivo):
                     sheets = wb_root.find('m:sheets', ns_main)
                     first_sheet = sheets.find('m:sheet', ns_main) if sheets is not None else None
                     if first_sheet is None:
-                        raise ValueError('No se encontró ninguna hoja en workbook.xml')
+                        raise ValueError('No se encontrÃ³ ninguna hoja en workbook.xml')
                     sheet_rid = first_sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
 
                     wb_rels_root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
@@ -180,7 +180,7 @@ def extraer_imagenes_de_excel_real(archivo):
                             rel_node = rel
                             break
                     if rel_node is None:
-                        raise ValueError('No se pudo resolver la relación de la hoja activa')
+                        raise ValueError('No se pudo resolver la relaciÃ³n de la hoja activa')
 
                     sheet_path = _norm_zip_path('xl', rel_node.attrib.get('Target', ''))
                     sheet_dir = posixpath.dirname(sheet_path)
@@ -204,13 +204,13 @@ def extraer_imagenes_de_excel_real(archivo):
                                 break
 
                         if drawing_rel is None:
-                            print('   -> No se encontró relación al drawing en la hoja activa')
+                            print('   -> No se encontrÃ³ relaciÃ³n al drawing en la hoja activa')
                         else:
                             drawing_path = _norm_zip_path(sheet_dir, drawing_rel.attrib.get('Target', ''))
                             drawing_dir = posixpath.dirname(drawing_path)
                             drawing_rels_path = posixpath.join(drawing_dir, '_rels', posixpath.basename(drawing_path) + '.rels')
 
-                            # 4) Mapa rId -> target_path (más tolerante)
+                            # 4) Mapa rId -> target_path (mÃ¡s tolerante)
                             drawing_rels_root = ET.fromstring(z.read(drawing_rels_path))
                             media_by_rid = {}
                             for rel in drawing_rels_root.findall('pr:Relationship', ns_pkg_rel):
@@ -221,7 +221,7 @@ def extraer_imagenes_de_excel_real(archivo):
 
                             print(f"   -> Relaciones en drawing: {len(media_by_rid)}")
 
-                            # 5) Recorrer anchors con posición real y resolver bytes
+                            # 5) Recorrer anchors con posiciÃ³n real y resolver bytes
                             drawing_root = ET.fromstring(z.read(drawing_path))
                             anchors = (
                                 drawing_root.findall('.//xdr:twoCellAnchor', ns_draw)
@@ -230,7 +230,7 @@ def extraer_imagenes_de_excel_real(archivo):
                             )
                             print(f"   -> Anchors detectados en drawing: {len(anchors)}")
 
-                            # Guardamos candidatos para asignar por fila/posición horizontal
+                            # Guardamos candidatos para asignar por fila/posiciÃ³n horizontal
                             candidates = []
 
                             for anchor in anchors:
@@ -304,9 +304,9 @@ def extraer_imagenes_de_excel_real(archivo):
                                     print(f"   -> [ZIP-RELS] {media_s} es FIRMA de Fila {row} (col={col_s})")
 
         except Exception as e:
-            print(f"❌ Falló Plan B Dual (RELS): {e}")
+            print(f"âŒ FallÃ³ Plan B Dual (RELS): {e}")
 
-    # Rebobinar siempre al final para que Pandas no falle después
+    # Rebobinar siempre al final para que Pandas no falle despuÃ©s
     if hasattr(archivo, 'seek'): archivo.seek(0)
     
     return fotos_por_fila, firmas_por_fila
@@ -319,7 +319,7 @@ def procesar_foto_desde_excel(valor_celda, fila_numero=None, imagenes_excel=None
     1. Imagen incrustada en Excel (si existe)
     2. Ruta de archivo
     3. Datos en base64
-    4. None/vacío
+    4. None/vacÃ­o
     """
     # Prioridad 1: Imagen incrustada en el Excel
     if imagenes_excel and fila_numero and fila_numero in imagenes_excel:
@@ -330,7 +330,7 @@ def procesar_foto_desde_excel(valor_celda, fila_numero=None, imagenes_excel=None
     
     valor_str = str(valor_celda).strip()
     
-    # Prioridad 2: Es una ruta de archivo (probar con y sin normalización)
+    # Prioridad 2: Es una ruta de archivo (probar con y sin normalizaciÃ³n)
     rutas_a_probar = [
         valor_str,
         os.path.abspath(valor_str),
@@ -369,7 +369,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         Muestra solo los registros COMPLETOS:
         - Tienen Foto
         - Tienen Firma
-        - Tienen Número de Empleado
+        - Tienen NÃºmero de Empleado
         """
         queryset = self.get_queryset().exclude(
             Q(foto__isnull=True) | Q(foto='') |
@@ -391,7 +391,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         Endpoint para alimentar la data table del front.
         Columnas: Num Empleado, RFC, CURP, nombres, adscripcion, puesto.
         Filtros: foto y firma no nulos (incluyendo flag 1 o registro en NW_EMPL_FOTO_ANAM),
-        y que no estén marcados como impresos (impreso != 1).
+        y que no estÃ©n marcados como impresos (impreso != 1).
         """
         completos = _get_num_empleados_con_foto_firma()
 
@@ -402,7 +402,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             Q(impreso__isnull=True) | Q(impreso=0) | ~Q(impreso=1)
         )
 
-        # También incluir empleados con foto+firma en NW_EMPL_FOTO_ANAM
+        # TambiÃ©n incluir empleados con foto+firma en NW_EMPL_FOTO_ANAM
         if completos:
             qs_externos = self.get_queryset().filter(
                 num_empleado__in=completos
@@ -520,7 +520,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             
 
         return Response({
-            'status': 'Sincronización completada',
+            'status': 'SincronizaciÃ³n completada',
             'creados': creados,
             'actualizados': actualizados
         }, status=status.HTTP_200_OK)
@@ -528,7 +528,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='obtener-folio-maximo')
     def obtener_folio_maximo(self, request):
         """
-        Retorna el folio máximo actual de la tabla enrolamiento.
+        Retorna el folio mÃ¡ximo actual de la tabla enrolamiento.
         El front puede usar este valor para asignar el siguiente consecutivo.
         Respeta el formato con ceros a la izquierda (ej: 000001 -> 000002).
         Permite separar series por nuevo_laredo con query param ?nuevo_laredo=0|1
@@ -552,7 +552,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             folios = folios_queryset.values_list('folio', flat=True)
             
             if not folios:
-                # Si no hay folios, empezar desde 000001 (6 dígitos por defecto)
+                # Si no hay folios, empezar desde 000001 (6 dÃ­gitos por defecto)
                 return Response({
                     'status': 'success',
                     'folio_maximo': '000000',
@@ -560,7 +560,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                     'serie_nuevo_laredo': nuevo_laredo_param
                 }, status=status.HTTP_200_OK)
             
-            # Encontrar el folio con mayor valor numérico
+            # Encontrar el folio con mayor valor numÃ©rico
             folio_max_valor = 0
             folio_max_str = ''
             longitud_formato = 6  # Default
@@ -577,7 +577,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                     continue
             
             if folio_max_valor == 0:
-                # No se encontraron folios válidos
+                # No se encontraron folios vÃ¡lidos
                 return Response({
                     'status': 'success',
                     'folio_maximo': '000000',
@@ -599,7 +599,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({
                 'status': 'error',
-                'mensaje': f'Error al obtener folio máximo: {str(e)}'
+                'mensaje': f'Error al obtener folio mÃ¡ximo: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='guardar-foto-firma')
@@ -629,7 +629,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
 
         emplid = str(enrolamiento.num_empleado or '').strip()
         if not emplid:
-            return Response({'status': 'error', 'mensaje': 'El empleado no tiene número de empleado'}, status=400)
+            return Response({'status': 'error', 'mensaje': 'El empleado no tiene nÃºmero de empleado'}, status=400)
 
         emplid_padded = emplid.zfill(11)
         emplid_stripped = emplid.lstrip('0') or '0'
@@ -668,15 +668,15 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get', 'post'], url_path='busqueda-avanzada')
     def busqueda_avanzada(self, request):
         """
-        Endpoint de búsqueda avanzada para ag-grid.
-        Permite filtrar por múltiples campos y retorna todos los detalles.
+        Endpoint de bÃºsqueda avanzada para ag-grid.
+        Permite filtrar por mÃºltiples campos y retorna todos los detalles.
         Soporta filtros por: num_empleado, rfc, curp, nombre, paterno, materno,
         puesto, adscripcion, folio, impreso, fecha_expedicion_desde, fecha_expedicion_hasta.
         """
         queryset = self.get_queryset()
         queryset_familiares = EnrolamientoFamiliar.objects.all().order_by('-id_enrolamiento')
         
-        # Obtener parámetros de filtro (soporta GET y POST)
+        # Obtener parÃ¡metros de filtro (soporta GET y POST)
         params = request.query_params if request.method == 'GET' else request.data
         
         # Filtros de texto
@@ -716,7 +716,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(folio__icontains=params['folio'])
             queryset_familiares = queryset_familiares.filter(folio_familiares__icontains=params['folio'])
         
-        # Filtro por estado de impresión
+        # Filtro por estado de impresiÃ³n
         if params.get('impreso') is not None:
             impreso_val = params['impreso']
             if impreso_val == '1' or impreso_val == 1:
@@ -726,7 +726,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                 queryset = queryset.filter(Q(impreso=0) | Q(impreso__isnull=True))
                 queryset_familiares = queryset_familiares.filter(Q(impreso=0) | Q(impreso__isnull=True))
         
-        # Filtros por rango de fechas de expedición
+        # Filtros por rango de fechas de expediciÃ³n
         if params.get('fecha_expedicion_desde'):
             queryset = queryset.filter(fecha_expedicion__gte=params['fecha_expedicion_desde'])
             queryset_familiares = queryset_familiares.filter(fecha_expedicion__gte=params['fecha_expedicion_desde'])
@@ -753,12 +753,12 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(fecha_registro__date__lte=params['fecha_registro_hasta'])
             queryset_familiares = queryset_familiares.filter(fecha_registro__date__lte=params['fecha_registro_hasta'])
         
-        # Filtro por fecha de registro específica
+        # Filtro por fecha de registro especÃ­fica
         if params.get('fecha_registro'):
             queryset = queryset.filter(fecha_registro__date=params['fecha_registro'])
             queryset_familiares = queryset_familiares.filter(fecha_registro__date=params['fecha_registro'])
         
-        # Filtro por fecha de expedición específica
+        # Filtro por fecha de expediciÃ³n especÃ­fica
         if params.get('fecha_expedicion'):
             queryset = queryset.filter(fecha_expedicion=params['fecha_expedicion'])
             queryset_familiares = queryset_familiares.filter(fecha_expedicion=params['fecha_expedicion'])
@@ -817,9 +817,9 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='estadisticas')
     def estadisticas(self, request):
         """
-        Retorna estadísticas generales del sistema de credencialización.
+        Retorna estadÃ­sticas generales del sistema de credencializaciÃ³n.
         Incluye: total de credenciales, impresas, pendientes, impresas hoy,
-        por adscripción, y tendencias.
+        por adscripciÃ³n, y tendencias.
         Soporta filtrado por rango de fechas (fecha_desde, fecha_hasta).
         """
         from django.db.models import Count, Q
@@ -829,7 +829,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
             # Fecha de hoy
             hoy = datetime.now().date()
             
-            # Obtener parámetros de filtrado por fechas
+            # Obtener parÃ¡metros de filtrado por fechas
             fecha_desde = request.query_params.get('fecha_desde')
             fecha_hasta = request.query_params.get('fecha_hasta')
             
@@ -858,7 +858,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                 fecha_expedicion=hoy
             ).count()
             
-            # Credenciales pendientes de impresión (completas pero no impresas)
+            # Credenciales pendientes de impresiÃ³n (completas pero no impresas)
             credenciales_pendientes = queryset_base.exclude(
                 Q(foto__isnull=True) | Q(foto=b'') |
                 Q(firma__isnull=True) | Q(firma=b'')
@@ -886,12 +886,12 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                 Q(firma__isnull=True) | Q(firma=b'')
             ).values('id_enrolamiento', 'num_empleado', 'rfc', 'nombre', 'paterno', 'materno', 'adscripcion')
             
-            # Credenciales por adscripción (top 10)
+            # Credenciales por adscripciÃ³n (top 10)
             por_adscripcion = queryset_base.values('adscripcion').annotate(
                 total=Count('id_enrolamiento')
             ).order_by('-total')[:10]
             
-            # Estadísticas de los últimos 7 días
+            # EstadÃ­sticas de los Ãºltimos 7 dÃ­as
             hace_7_dias = hoy - timedelta(days=7)
             credenciales_ultima_semana = queryset_base.filter(
                 fecha_registro__gte=hace_7_dias
@@ -902,7 +902,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                 fecha_expedicion__gte=hace_7_dias
             ).count()
             
-            # Estadísticas del mes actual
+            # EstadÃ­sticas del mes actual
             inicio_mes = hoy.replace(day=1)
             credenciales_mes_actual = queryset_base.filter(
                 fecha_registro__gte=inicio_mes
@@ -954,6 +954,35 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
                 'mensaje': f'Error al obtener estadísticas: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=True, methods=['post'], url_path='marcar-impreso')
+    def marcar_impreso(self, request, pk=None):
+        try:
+            enrolamiento = self.get_object()
+            
+            enrolamiento.impreso = 1
+            fecha_expedicion_payload = request.data.get('fecha_expedicion')
+            if not enrolamiento.fecha_expedicion:
+                from django.utils import timezone
+                enrolamiento.fecha_expedicion = fecha_expedicion_payload or timezone.now().date()
+            enrolamiento.save()
+
+            return Response({
+                'status': 'success',
+                'mensaje': f'Credencial empleada {enrolamiento.folio or enrolamiento.id_enrolamiento} marcada como impresa',
+                'data': {
+                    'id_enrolamiento': enrolamiento.id_enrolamiento,
+                    'folio': enrolamiento.folio,
+                    'impreso': enrolamiento.impreso,
+                    'fecha_expedicion': enrolamiento.fecha_expedicion
+                }
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'mensaje': f'Error al marcar empleado como impreso: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 
 class EnrolamientoFamiliarViewSet(viewsets.ModelViewSet):
     queryset = EnrolamientoFamiliar.objects.all().order_by('-id_enrolamiento')
@@ -965,7 +994,7 @@ class EnrolamientoFamiliarViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='obtener-folio-maximo-familiares')
     def obtener_folio_maximo_familiares(self, request):
         """
-        Retorna el folio máximo actual de familiares con consecutivo independiente.
+        Retorna el folio mÃ¡ximo actual de familiares con consecutivo independiente.
         Usa el campo folio_familiares y mantiene ceros a la izquierda.
         """
         try:
@@ -1015,7 +1044,7 @@ class EnrolamientoFamiliarViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({
                 'status': 'error',
-                'mensaje': f'Error al obtener folio máximo de familiares: {str(e)}'
+                'mensaje': f'Error al obtener folio mÃ¡ximo de familiares: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='marcar-impreso')
@@ -1243,12 +1272,12 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
             if df is None or df.empty:
                 return Response({
                     'status': 'error',
-                    'mensaje': 'No hay registros válidos para procesar.'
+                    'mensaje': 'No hay registros vÃ¡lidos para procesar.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             rows = [self._sig_payload_from_row(row) for _, row in df.iterrows()]
 
-            # --- Validación de duplicados en el archivo ---
+            # --- ValidaciÃ³n de duplicados en el archivo ---
             curp_count = {}
             num_emp_count = {}
             for r in rows:
@@ -1270,10 +1299,10 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                     errores['numeros_empleado_duplicados'] = nums_dup
                 return Response({
                     'status': 'error',
-                    'mensaje': 'El archivo contiene registros duplicados. No puede haber más de un empleado con la misma CURP o el mismo número de empleado.',
+                    'mensaje': 'El archivo contiene registros duplicados. No puede haber mÃ¡s de un empleado con la misma CURP o el mismo nÃºmero de empleado.',
                     **errores
                 }, status=status.HTTP_400_BAD_REQUEST)
-            # --- Fin validación duplicados ---
+            # --- Fin validaciÃ³n duplicados ---
 
             rows_by_empleado = {}
             for row in rows:
@@ -1479,7 +1508,7 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
                     {
                         'no_empleado': obj.no_empleado or '',
                         'nombre': f"{obj.nombres or ''} {obj.primer_apellido or ''} {obj.segundo_apellido or ''}".strip(),
-                        'tipo': 'Actualización'
+                        'tipo': 'ActualizaciÃ³n'
                     }
                     for obj in sig_update
                 ]
@@ -1562,7 +1591,7 @@ class CustomLoginView(APIView):
                         'nombreCompleto': f"{user.first_name} {user.last_name}",
                         'email': user.email,
                         'unidadAdscripcion': getattr(user, 'adscripcion', ''), 
-                        'area': 'Área del usuario' 
+                        'area': 'Ãrea del usuario' 
                     }
                 }, status=status.HTTP_200_OK)
             else:
@@ -1578,7 +1607,7 @@ class CustomLoginView(APIView):
 def foto_firma_empleado(request, emplid):
     """
     Obtiene foto y firma de safirho_db.NW_EMPL_FOTO_ANAM para un EMPLID dado.
-    Prueba con el valor tal cual, zero-padded a 11 dígitos y sin ceros a la izquierda.
+    Prueba con el valor tal cual, zero-padded a 11 dÃ­gitos y sin ceros a la izquierda.
     """
     emplid_str = str(emplid).strip()
     emplid_padded = emplid_str.zfill(11)
