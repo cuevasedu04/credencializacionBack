@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar
+from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva
 import base64
 import binascii
 
@@ -127,3 +127,11 @@ class LoginSerializer(serializers.Serializer):
         email = serializers.EmailField()
         password = serializers.CharField()
         idSistema = serializers.IntegerField(required = False)
+class CargaMasivaSerializer(serializers.ModelSerializer):
+    foto = Base64BinaryField(required=False, allow_null=True)
+    firma = Base64BinaryField(required=False, allow_null=True)
+
+    class Meta:
+        model = CargaMasiva
+        fields = '__all__'
+

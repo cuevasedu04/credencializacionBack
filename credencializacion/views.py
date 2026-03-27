@@ -3,8 +3,8 @@ from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
-from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar
-from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer
+from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva
+from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer, CargaMasivaSerializer
 from django.db.models import Q, Count, Min
 from django.db import models, transaction, connection
 from django.contrib.auth import authenticate
@@ -1949,3 +1949,71 @@ def foto_firma_empleado(request, emplid):
 
     except Exception as e:
         return Response({'foto': None, 'firma': None, 'encontrado': False, 'error': str(e)}, status=200)
+class CargaMasivaViewSet(viewsets.ModelViewSet):
+    queryset = CargaMasiva.objects.filter(activo=True)
+    serializer_class = CargaMasivaSerializer
+
+    @action(detail=False, methods=['post'], url_path='auto-guardado')
+    def auto_guardado(self, request):
+        lote = request.data.get('lote')
+        rfc = request.data.get('rfc')
+        record_id = request.data.get('id')
+
+        if not lote or not rfc:
+            return Response({'error': 'Lote y RFC son requeridos.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        instance = None
+        if record_id:
+            instance = CargaMasiva.objects.filter(id=record_id, activo=True).first()
+        if not instance:
+            instance = CargaMasiva.objects.filter(lote=lote, rfc=rfc, activo=True).first()
+            serializer = self.get_serializer(data=request.data)
+            
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK if instance else status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'], url_path='siguiente-lote')
+    def siguiente_lote(self, request):
+        ultimo = CargaMasiva.objects.exclude(lote__isnull=True).order_by('-id').first()
+        siguiente_num = 1
+        if ultimo and ultimo.lote:
+            import re
+            match = re.search(r'LOTE-(\d+)', ultimo.lote)
+            if match:
+                siguiente_num = int(match.group(1)) + 1
+        return Response({'lote': f'LOTE-{siguiente_num:05d}'}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='cancelar-lote')
+    def cancelar_lote(self, request):
+        lote = request.data.get('lote')
+        if not lote:
+            return Response({'error': 'Lote es requerido.'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        registros = CargaMasiva.objects.filter(lote=lote, activo=True)
+        count = registros.count()
+        registros.update(activo=False)
+        
+        return Response({'message': f'Lote {lote} cancelado.', 'registros_eliminados': count}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='progreso-lote')
+    def progreso_lote(self, request):
+        lote = request.query_params.get('lote')
+        if not lote:
+            return Response({'error': 'Lote es requerido.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        registros = CargaMasiva.objects.filter(lote=lote, activo=True).order_by('id')
+        total_enrolados = registros.count()
+        
+        # En Python, para BinaryField, si no es None o b'' cuenta como capturado.
+        total_fotos = sum(1 for r in registros if r.foto)
+        total_firmas = sum(1 for r in registros if r.firma)
+        
+        return Response({
+            'lote': lote,
+            'total_enrolados': total_enrolados,
+            'total_fotografias': total_fotos,
+            'total_firmas': total_firmas,
+            'registros': self.get_serializer(registros, many=True).data
+        }, status=status.HTTP_200_OK)

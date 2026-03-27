@@ -17,7 +17,7 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from credencializacion.views import EnrolamientoViewSet, SigViewSet, CustomLoginView, EnrolamientoFamiliarViewSet, foto_firma_empleado
+from credencializacion.views import EnrolamientoViewSet, SigViewSet, CustomLoginView, EnrolamientoFamiliarViewSet, foto_firma_empleado, CargaMasivaViewSet
 
 
 router = DefaultRouter()
@@ -25,6 +25,7 @@ router = DefaultRouter()
 router.register(r'expedientes', EnrolamientoViewSet)
 router.register(r'expedientes-familiares', EnrolamientoFamiliarViewSet)
 router.register(r'empleados-sig', SigViewSet)
+router.register(r'carga-masiva', CargaMasivaViewSet, basename='carga-masiva')
 
 urlpatterns = [
     path('admin/', admin.site.urls),

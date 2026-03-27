@@ -119,3 +119,18 @@ class SicreTblSig(models.Model):
 
     def __str__(self):
         return f"{self.empleado_anam} - {self.nombres}"
+
+class CargaMasiva(models.Model):
+    id = models.AutoField(primary_key=True)
+    rfc = models.CharField(max_length=18)
+    nombre = models.CharField(max_length=200, blank=True, null=True)
+    foto = models.BinaryField(blank=True, null=True)
+    firma = models.BinaryField(blank=True, null=True)
+    lote = models.CharField(max_length=100)
+    fecha_enrolamiento = models.DateTimeField(auto_now_add=True)
+    usuario_enrola = models.IntegerField(blank=True, null=True)
+    activo = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = 'sicre_tbl_carga_masiva'
+
