@@ -121,6 +121,9 @@ class SicreTblSig(models.Model):
         return f"{self.empleado_anam} - {self.nombres}"
 
 class CargaMasiva(models.Model):
+    # ==========================================
+    # 1. CAMPOS ORIGINALES DE CARGA MASIVA
+    # ==========================================
     id = models.AutoField(primary_key=True)
     rfc = models.CharField(max_length=18)
     nombre = models.CharField(max_length=200, blank=True, null=True)
@@ -129,8 +132,42 @@ class CargaMasiva(models.Model):
     lote = models.CharField(max_length=100)
     fecha_enrolamiento = models.DateTimeField(auto_now_add=True)
     usuario_enrola = models.IntegerField(blank=True, null=True)
-    activo = models.BooleanField(default=True)
+    activo = models.BooleanField(default=True) # Se mantiene Booleano (Soft Delete)
+
+    # ==========================================
+    # 2. CAMPOS HEREDADOS DE SICRE_TBL_SIG
+    # ==========================================
+    empleado_anam = models.CharField(max_length=50, blank=True, null=True)
+    no_empleado = models.CharField(max_length=50, blank=True, null=True)
+    curp = models.CharField(max_length=18, blank=True, null=True)
+    nombres = models.CharField(max_length=150, blank=True, null=True)
+    primer_apellido = models.CharField(max_length=100, blank=True, null=True)
+    segundo_apellido = models.CharField(max_length=100, blank=True, null=True)
+    area = models.CharField(max_length=150, blank=True, null=True)
+    cargo = models.CharField(max_length=150, blank=True, null=True)
+    fecha_expedicion = models.DateField(blank=True, null=True) # Compartido con Enrolamiento
+    firma_drh = models.CharField(max_length=255, blank=True, null=True)
+    cargo_drh = models.CharField(max_length=255, blank=True, null=True)
+    qr = models.TextField(blank=True, null=True)
+    estatus = models.CharField(max_length=100, blank=True, null=True)
+    estado_hum = models.CharField(max_length=100, blank=True, null=True)
+    estado_nom = models.CharField(max_length=100, blank=True, null=True)
+
+    # ==========================================
+    # 3. CAMPOS HEREDADOS DE ENROLAMIENTO
+    # ==========================================
+    inicio_vig = models.DateField(blank=True, null=True)
+    fin_vig = models.DateField(blank=True, null=True)
+    folio = models.CharField(max_length=50, blank=True, null=True)
+    impreso = models.IntegerField(blank=True, null=True)
+    provisional = models.IntegerField(db_column='provisional', blank=True, null=True)
+    id_usuario_registra = models.IntegerField(blank=True, null=True)
+    fecha_registro = models.DateTimeField(auto_now_add=True, blank=True, null=True)
+    id_usuario_modifica = models.IntegerField(blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True)
+    nuevo_laredo = models.IntegerField(blank=True, null=True)
+    nivel_credencial = models.CharField(max_length=50, blank=True, null=True)
+    layout_credencial = models.CharField(max_length=30, blank=True, null=True)
 
     class Meta:
         db_table = 'sicre_tbl_carga_masiva'
-

@@ -1949,9 +1949,25 @@ def foto_firma_empleado(request, emplid):
 
     except Exception as e:
         return Response({'foto': None, 'firma': None, 'encontrado': False, 'error': str(e)}, status=200)
+class CargaMasivaPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+
 class CargaMasivaViewSet(viewsets.ModelViewSet):
-    queryset = CargaMasiva.objects.filter(activo=True)
     serializer_class = CargaMasivaSerializer
+    pagination_class = CargaMasivaPagination
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['rfc', 'curp', 'nombres', 'primer_apellido', 'segundo_apellido',
+                     'empleado_anam', 'no_empleado', 'area', 'cargo', 'estatus']
+
+    def get_queryset(self):
+        qs = CargaMasiva.objects.filter(activo=True).order_by('nombres', 'primer_apellido')
+        lote = self.request.query_params.get('lote')
+        if lote:
+            qs = qs.filter(lote=lote)
+        return qs
 
     @action(detail=False, methods=['post'], url_path='auto-guardado')
     def auto_guardado(self, request):
@@ -1967,8 +1983,12 @@ class CargaMasivaViewSet(viewsets.ModelViewSet):
             instance = CargaMasiva.objects.filter(id=record_id, activo=True).first()
         if not instance:
             instance = CargaMasiva.objects.filter(lote=lote, rfc=rfc, activo=True).first()
+
+        if instance:
+            serializer = self.get_serializer(instance, data=request.data, partial=True)
+        else:
             serializer = self.get_serializer(data=request.data)
-            
+
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data, status=status.HTTP_200_OK if instance else status.HTTP_201_CREATED)
@@ -1997,23 +2017,160 @@ class CargaMasivaViewSet(viewsets.ModelViewSet):
         
         return Response({'message': f'Lote {lote} cancelado.', 'registros_eliminados': count}, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['post'], url_path='cargar-lote-excel')
+    def cargar_lote_excel(self, request):
+        """
+        Recibe un lote existente y un archivo Excel con columnas de SIG.
+        Para cada fila del Excel busca en sicre_tbl_carga_masiva el registro
+        cuyo campo rfc coincida con la columna CURP del Excel (dentro del lote).
+        Si encuentra coincidencia actualiza todos los campos del registro.
+        Si no encuentra, lo reporta en 'no_encontrados'.
+
+        Respuesta:
+        {
+          "lote": "LOTE-00001",
+          "total": 50,
+          "actualizados": 45,
+          "no_encontrados": [ { "curp": "...", "nombre": "..." }, ... ]
+        }
+        """
+        archivo = request.FILES.get('archivo')
+        lote = request.data.get('lote')
+
+        if not archivo:
+            return Response({'error': 'Se requiere el archivo Excel.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not lote:
+            return Response({'error': 'Se requiere seleccionar un lote.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not CargaMasiva.objects.filter(lote=lote, activo=True).exists():
+            return Response({'error': f'El lote {lote} no existe o no tiene registros activos.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # ── 1. Parsear Excel ───────────────────────────────────────────────────
+        sig_vs = SigViewSet()
+        df, missing = sig_vs._build_dataframe(archivo)
+
+        if missing:
+            return Response({
+                'error': 'El archivo no contiene todas las columnas requeridas.',
+                'columnas_faltantes': missing
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if df is None or df.empty:
+            return Response({'error': 'El archivo no tiene registros válidos.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        rows = [sig_vs._sig_payload_from_row(row) for _, row in df.iterrows()]
+
+        # ── 2. Actualizar registros del lote haciendo match CURP → rfc ─────────
+        campos_sig = [
+            'empleado_anam', 'no_empleado', 'curp', 'nombres',
+            'primer_apellido', 'segundo_apellido', 'area', 'cargo',
+            'fecha_expedicion', 'firma_drh', 'cargo_drh', 'qr',
+            'estatus', 'estado_hum', 'estado_nom',
+        ]
+
+        actualizados = 0
+        no_encontrados = []
+
+        with transaction.atomic():
+            for row in rows:
+                curp = (row.get('curp') or '').strip()
+                nombre = ' '.join(filter(None, [
+                    row.get('nombres'), row.get('primer_apellido'), row.get('segundo_apellido')
+                ])).strip()
+
+                try:
+                    registro = CargaMasiva.objects.get(lote=lote, rfc=curp, activo=True)
+                    for campo in campos_sig:
+                        valor = row.get(campo)
+                        if valor is not None:
+                            setattr(registro, campo, valor)
+                    registro.save(update_fields=campos_sig)
+                    actualizados += 1
+                except CargaMasiva.DoesNotExist:
+                    no_encontrados.append({'curp': curp, 'nombre': nombre})
+                except CargaMasiva.MultipleObjectsReturned:
+                    # Si hay duplicados en el lote, actualiza el primero
+                    registro = CargaMasiva.objects.filter(lote=lote, rfc=curp, activo=True).first()
+                    for campo in campos_sig:
+                        valor = row.get(campo)
+                        if valor is not None:
+                            setattr(registro, campo, valor)
+                    registro.save(update_fields=campos_sig)
+                    actualizados += 1
+
+        return Response({
+            'lote': lote,
+            'total': len(rows),
+            'actualizados': actualizados,
+            'no_encontrados': no_encontrados,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='lotes-resumen')
+    def lotes_resumen(self, request):
+        from django.db.models import Count, Max, Min, Q as DQ
+        lotes = (
+            CargaMasiva.objects
+            .filter(activo=True)
+            .values('lote')
+            .annotate(
+                total=Count('id'),
+                total_fotos=Count('id', filter=DQ(foto__isnull=False)),
+                total_firmas=Count('id', filter=DQ(firma__isnull=False)),
+                fecha_inicio=Min('fecha_enrolamiento'),
+                fecha_ultimo=Max('fecha_enrolamiento'),
+            )
+            .order_by('-fecha_ultimo')
+        )
+        return Response(list(lotes), status=status.HTTP_200_OK)
+
     @action(detail=False, methods=['get'], url_path='progreso-lote')
     def progreso_lote(self, request):
         lote = request.query_params.get('lote')
+        sin_imagenes = request.query_params.get('sin_imagenes', '0') == '1'
         if not lote:
             return Response({'error': 'Lote es requerido.'}, status=status.HTTP_400_BAD_REQUEST)
-            
-        registros = CargaMasiva.objects.filter(lote=lote, activo=True).order_by('id')
-        total_enrolados = registros.count()
-        
-        # En Python, para BinaryField, si no es None o b'' cuenta como capturado.
-        total_fotos = sum(1 for r in registros if r.foto)
-        total_firmas = sum(1 for r in registros if r.firma)
-        
+
+        registros_qs = list(CargaMasiva.objects.filter(lote=lote, activo=True).order_by('id'))
+        total_enrolados = len(registros_qs)
+        total_fotos = sum(1 for r in registros_qs if r.foto)
+        total_firmas = sum(1 for r in registros_qs if r.firma)
+
+        if sin_imagenes:
+            datos_registros = [
+                {
+                    'id': r.id,
+                    'rfc': r.rfc,
+                    'nombre': r.nombre,
+                    'nombres': r.nombres,
+                    'primer_apellido': r.primer_apellido,
+                    'segundo_apellido': r.segundo_apellido,
+                    'no_empleado': r.no_empleado,
+                    'empleado_anam': r.empleado_anam,
+                    'curp': r.curp,
+                    'area': r.area,
+                    'cargo': r.cargo,
+                    'lote': r.lote,
+                    'fecha_enrolamiento': r.fecha_enrolamiento.isoformat() if r.fecha_enrolamiento else None,
+                    'has_foto': bool(r.foto),
+                    'has_firma': bool(r.firma),
+                    'activo': r.activo,
+                    'nivel_credencial': r.nivel_credencial,
+                    'layout_credencial': r.layout_credencial,
+                    'nuevo_laredo': r.nuevo_laredo,
+                    'folio': r.folio,
+                    'fecha_expedicion': r.fecha_expedicion.isoformat() if r.fecha_expedicion else None,
+                    'fin_vig': r.fin_vig.isoformat() if r.fin_vig else None,
+                    'inicio_vig': r.inicio_vig.isoformat() if r.inicio_vig else None,
+                }
+                for r in registros_qs
+            ]
+        else:
+            datos_registros = self.get_serializer(registros_qs, many=True).data
+
         return Response({
             'lote': lote,
             'total_enrolados': total_enrolados,
             'total_fotografias': total_fotos,
             'total_firmas': total_firmas,
-            'registros': self.get_serializer(registros, many=True).data
+            'registros': datos_registros,
         }, status=status.HTTP_200_OK)
