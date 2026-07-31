@@ -1865,11 +1865,21 @@ class CustomLoginView(APIView):
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         if serializer.is_valid():
-            email = serializer.validated_data['email']
+            identifier = serializer.validated_data['email']
             password = serializer.validated_data['password']
-            
-      
-            user = authenticate(request, username=email, password=password)
+
+            # Intenta autenticar por username directo
+            user = authenticate(request, username=identifier, password=password)
+
+            # Si falla, busca el username asociado al email ingresado
+            if user is None and '@' in identifier:
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
+                try:
+                    db_user = User.objects.get(email__iexact=identifier)
+                    user = authenticate(request, username=db_user.username, password=password)
+                except User.DoesNotExist:
+                    pass
 
             if user is not None:
                 if not user.is_active:
@@ -1889,7 +1899,8 @@ class CustomLoginView(APIView):
                         'nombreCompleto': f"{user.first_name} {user.last_name}",
                         'email': user.email,
                         'unidadAdscripcion': getattr(user, 'adscripcion', ''), 
-                        'area': 'Ãrea del usuario' 
+                        'area': 'SICRE',
+                        'idUsuarioRol': 9999 if user.is_superuser else (2 if user.is_staff else 4),
                     }
                 }, status=status.HTTP_200_OK)
             else:

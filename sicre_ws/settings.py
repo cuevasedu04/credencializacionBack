@@ -33,7 +33,7 @@ SECRET_KEY = os.environ.get(
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True if os.environ.get('DJANGO_DEBUG', 'True') == 'True' else False
 
-ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '168.231.73.222,localhost,127.0.0.1,sicre-anam.ddns.net,http://localhost:5555,siorh-anam.ddns.net').split(',')
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '168.231.73.222,localhost,127.0.0.1,sicre-anam.ddns.net,siorh-anam.ddns.net').split(',')
 CSRF_TRUSTED_ORIGINS = os.environ.get('CSRF_TRUSTED_ORIGINS', 'https://sicre-anam.ddns.net,https://168.231.73.222,https://localhost:5555,https://siorh-anam.ddns.net').split(',')
 
 # Asegurarnos de que Django sepa que estamos detrás de un proxy seguro
@@ -53,6 +53,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'credencializacion',
     'rest_framework',
+    'rest_framework.authtoken',
 ]
 
 MIDDLEWARE = [
@@ -92,10 +93,10 @@ WSGI_APPLICATION = 'sicre_ws.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ.get('DB_NAME', 'sicre_db'),
-        'USER': os.environ.get('DB_USER', 'eduardo'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', '4n4m@2025'),
-        'HOST': os.environ.get('DB_HOST', '168.231.73.222'),
+        'NAME': os.environ.get('DB_NAME'),
+        'USER': os.environ.get('DB_USER'),
+        'PASSWORD': os.environ.get('DB_PASSWORD'),
+        'HOST': os.environ.get('DB_HOST'),
         'PORT': os.environ.get('DB_PORT', '3306'),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",

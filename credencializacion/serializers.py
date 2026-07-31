@@ -124,7 +124,7 @@ class ArchivoExcelSerializer(serializers.Serializer):
     archivo = serializers.FileField()
 
 class LoginSerializer(serializers.Serializer):
-        email = serializers.EmailField()
+        email = serializers.CharField()  # acepta username o email
         password = serializers.CharField()
         idSistema = serializers.IntegerField(required = False)
 class CargaMasivaSerializer(serializers.ModelSerializer):
