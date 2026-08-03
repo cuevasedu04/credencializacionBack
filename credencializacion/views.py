@@ -3,8 +3,17 @@ from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
-from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva
-from .serializers import EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer, ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer, CargaMasivaSerializer
+from .models import (
+    Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
+    EnrolamientoCredencial, PlantillaCredencial,
+)
+from .serializers import (
+    EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer,
+    ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer,
+    CargaMasivaSerializer, EnrolamientoCredencialSerializer, PlantillaCredencialSerializer,
+)
+from . import media_utils
+from django.conf import settings
 from django.db.models import Q, Count, Min
 from django.db import models, transaction, connection
 from django.contrib.auth import authenticate
@@ -2185,3 +2194,311 @@ class CargaMasivaViewSet(viewsets.ModelViewSet):
             'total_firmas': total_firmas,
             'registros': datos_registros,
         }, status=status.HTTP_200_OK)
+
+
+# ==========================================================================
+# NUEVO ESQUEMA: enrolamientos con medios en disco + plantillas tipo canvas
+# ==========================================================================
+
+class EnrolamientoCredencialPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+
+class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
+    """
+    Tabla principal del nuevo editor de credenciales.
+
+    A diferencia de EnrolamientoViewSet, aqui foto/firma son rutas dentro de
+    MEDIA_ROOT y se exponen como URLs servibles ('/media/fotos/123.jpg').
+    """
+    queryset = EnrolamientoCredencial.objects.all().order_by('-id_enrolamiento')
+    serializer_class = EnrolamientoCredencialSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['num_empleado', 'rfc', 'curp', 'nombre', 'paterno', 'materno']
+    pagination_class = EnrolamientoCredencialPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+
+        num_empleado = self.request.query_params.get('num_empleado')
+        if num_empleado:
+            qs = qs.filter(num_empleado=str(num_empleado).strip())
+
+        solo_activos = self.request.query_params.get('activo')
+        if solo_activos is not None and str(solo_activos) != '':
+            qs = qs.filter(activo=int(solo_activos))
+
+        return qs
+
+    def perform_create(self, serializer):
+        instancia = serializer.save()
+        # Si el empleado ya tenia foto/firma historicas en disco, vincularlas.
+        if instancia.resolver_archivo_existente():
+            instancia.save(update_fields=['foto', 'firma'])
+
+    def perform_update(self, serializer):
+        instancia = serializer.save(fecha_modificacion=timezone.now())
+        if instancia.resolver_archivo_existente():
+            instancia.save(update_fields=['foto', 'firma'])
+
+    @action(detail=False, methods=['get'], url_path='buscar-empleado')
+    def buscar_empleado(self, request):
+        """
+        Busca un empleado por num_empleado en la tabla nueva y, si no existe ahi,
+        cae a las tablas historicas (Enrolamiento / SIG) para prellenar la captura.
+
+        Siempre resuelve las rutas de foto/firma existentes en MEDIA_ROOT, de modo
+        que se pueda reconstruir la credencial de cualquier empleado ya enrolado.
+        """
+        num_empleado = (request.query_params.get('num_empleado') or '').strip()
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registro = EnrolamientoCredencial.objects.filter(num_empleado=num_empleado).first()
+        if registro:
+            registro.resolver_archivo_existente(guardar=True)
+            return Response({
+                'status': 'success',
+                'origen': 'enrolamiento_credencial',
+                'datos': EnrolamientoCredencialSerializer(registro).data,
+            })
+
+        datos = None
+        origen = None
+
+        historico = Enrolamiento.objects.filter(num_empleado=num_empleado).first()
+        if historico:
+            origen = 'enrolamiento'
+            datos = {
+                'num_empleado': historico.num_empleado,
+                'rfc': historico.rfc,
+                'curp': historico.curp,
+                'nombre': historico.nombre,
+                'paterno': historico.paterno,
+                'materno': historico.materno,
+                'apellidos': historico.apellidos,
+                'puesto': historico.puesto,
+                'adscripcion': historico.adscripcion,
+                'inicio_vig': historico.inicio_vig,
+                'fin_vig': historico.fin_vig,
+                'folio': historico.folio,
+                'fecha_expedicion': historico.fecha_expedicion,
+                'layout_credencial': historico.layout_credencial,
+            }
+        else:
+            sig = SicreTblSig.objects.filter(
+                Q(no_empleado=num_empleado) | Q(empleado_anam=num_empleado)
+            ).first()
+            if sig:
+                origen = 'sig'
+                datos = {
+                    'num_empleado': sig.no_empleado or sig.empleado_anam,
+                    'rfc': sig.curp or '',
+                    'curp': sig.curp,
+                    'nombre': sig.nombres,
+                    'paterno': sig.primer_apellido,
+                    'materno': sig.segundo_apellido,
+                    'apellidos': f"{sig.primer_apellido or ''} {sig.segundo_apellido or ''}".strip(),
+                    'puesto': sig.cargo,
+                    'area': sig.area,
+                    'adscripcion': sig.area,
+                    'fecha_expedicion': sig.fecha_expedicion,
+                }
+
+        if not datos:
+            return Response(
+                {'status': 'not_found', 'mensaje': f'No se encontro al empleado {num_empleado}.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Vincular medios historicos aunque el registro aun no exista en la tabla nueva.
+        ruta_foto = media_utils.resolver_foto(num_empleado)
+        ruta_firma = media_utils.resolver_firma(num_empleado)
+        datos['foto'] = media_utils.url_publica(ruta_foto)
+        datos['firma'] = media_utils.url_publica(ruta_firma)
+        datos['foto_ruta'] = ruta_foto
+        datos['firma_ruta'] = ruta_firma
+
+        return Response({'status': 'success', 'origen': origen, 'datos': datos})
+
+    @action(detail=False, methods=['get'], url_path='medios')
+    def medios(self, request):
+        """Resuelve unicamente las rutas de foto/firma en disco para un num_empleado."""
+        num_empleado = (request.query_params.get('num_empleado') or '').strip()
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ruta_foto = media_utils.resolver_foto(num_empleado)
+        ruta_firma = media_utils.resolver_firma(num_empleado)
+
+        return Response({
+            'status': 'success',
+            'num_empleado': num_empleado,
+            'foto': media_utils.url_publica(ruta_foto),
+            'firma': media_utils.url_publica(ruta_firma),
+            'foto_ruta': ruta_foto,
+            'firma_ruta': ruta_firma,
+            'encontrado': bool(ruta_foto or ruta_firma),
+        })
+
+    @action(detail=True, methods=['post'], url_path='guardar-medios')
+    def guardar_medios(self, request, pk=None):
+        """Guarda foto y/o firma (base64) en disco para un registro existente."""
+        registro = self.get_object()
+        identificador = registro.num_empleado or request.data.get('num_empleado')
+
+        if not identificador:
+            return Response(
+                {'status': 'error', 'mensaje': 'El registro no tiene num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actualizados = []
+        try:
+            if request.data.get('foto'):
+                registro.foto = media_utils.guardar_foto(request.data['foto'], identificador)
+                actualizados.append('foto')
+
+            if request.data.get('firma'):
+                registro.firma = media_utils.guardar_firma(request.data['firma'], identificador)
+                actualizados.append('firma')
+        except media_utils.MediaError as exc:
+            return Response(
+                {'status': 'error', 'mensaje': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not actualizados:
+            return Response(
+                {'status': 'error', 'mensaje': 'No se recibio foto ni firma.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registro.fecha_modificacion = timezone.now()
+        registro.save(update_fields=actualizados + ['fecha_modificacion'])
+
+        return Response({
+            'status': 'success',
+            'actualizados': actualizados,
+            'foto': registro.foto_url,
+            'firma': registro.firma_url,
+        })
+
+    @action(detail=True, methods=['post'], url_path='marcar-impreso')
+    def marcar_impreso(self, request, pk=None):
+        registro = self.get_object()
+        registro.impreso = 1
+        if not registro.fecha_expedicion:
+            registro.fecha_expedicion = request.data.get('fecha_expedicion') or timezone.now().date()
+        registro.fecha_modificacion = timezone.now()
+        registro.save(update_fields=['impreso', 'fecha_expedicion', 'fecha_modificacion'])
+
+        return Response({'status': 'success', 'id_enrolamiento': registro.id_enrolamiento})
+
+
+class PlantillaCredencialViewSet(viewsets.ModelViewSet):
+    """CRUD de plantillas disenadas en el editor tipo canvas (Fabric.js)."""
+    queryset = PlantillaCredencial.objects.all()
+    serializer_class = PlantillaCredencialSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['clave', 'nombre', 'descripcion']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        activo = self.request.query_params.get('activo')
+        if activo is not None and str(activo) != '':
+            qs = qs.filter(activo=str(activo).lower() in ('1', 'true', 'True'))
+        return qs
+
+    @action(detail=False, methods=['post'], url_path='subir-fondo')
+    def subir_fondo(self, request):
+        """
+        Recibe un fondo en base64 y lo guarda en MEDIA_ROOT/plantillas/.
+
+        Se usa desde el editor cuando el usuario sube su propia imagen de fondo
+        para el anverso o el reverso.
+        """
+        contenido = request.data.get('imagen')
+        nombre = request.data.get('nombre')
+
+        if not contenido:
+            return Response(
+                {'status': 'error', 'mensaje': 'No se recibio la imagen.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not nombre:
+            nombre = f"fondo_{timezone.now().strftime('%Y%m%d%H%M%S')}"
+
+        try:
+            ruta = media_utils.guardar_fondo_plantilla(contenido, nombre)
+        except media_utils.MediaError as exc:
+            return Response(
+                {'status': 'error', 'mensaje': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'status': 'success',
+            'ruta': ruta,
+            'url': media_utils.url_publica(ruta),
+        })
+
+    @action(detail=False, methods=['get'], url_path='fondos-disponibles')
+    def fondos_disponibles(self, request):
+        """Lista los fondos ya presentes en MEDIA_ROOT/plantillas/."""
+        carpeta = Path(settings.MEDIA_ROOT) / settings.MEDIA_DIR_PLANTILLAS
+        extensiones = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+
+        archivos = []
+        if carpeta.is_dir():
+            for archivo in sorted(carpeta.iterdir()):
+                if archivo.is_file() and archivo.suffix.lower() in extensiones:
+                    ruta = f'{settings.MEDIA_DIR_PLANTILLAS}/{archivo.name}'
+                    archivos.append({
+                        'nombre': archivo.name,
+                        'ruta': ruta,
+                        'url': media_utils.url_publica(ruta),
+                    })
+
+        return Response({'status': 'success', 'fondos': archivos})
+
+    @action(detail=True, methods=['post'], url_path='duplicar')
+    def duplicar(self, request, pk=None):
+        """Crea una copia editable de una plantilla existente."""
+        original = self.get_object()
+
+        clave_nueva = (request.data.get('clave') or f'{original.clave}_COPIA').strip().upper().replace(' ', '_')
+        if PlantillaCredencial.objects.filter(clave=clave_nueva).exists():
+            return Response(
+                {'status': 'error', 'mensaje': f'Ya existe una plantilla con clave {clave_nueva}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        copia = PlantillaCredencial.objects.create(
+            clave=clave_nueva,
+            nombre=request.data.get('nombre') or f'{original.nombre} (copia)',
+            descripcion=original.descripcion,
+            fondo_frente=original.fondo_frente,
+            fondo_reverso=original.fondo_reverso,
+            canvas_frente=original.canvas_frente,
+            canvas_reverso=original.canvas_reverso,
+            ancho_px=original.ancho_px,
+            alto_px=original.alto_px,
+            ancho_mm=original.ancho_mm,
+            alto_mm=original.alto_mm,
+            activo=True,
+        )
+
+        return Response(
+            {'status': 'success', 'plantilla': PlantillaCredencialSerializer(copia).data},
+            status=status.HTTP_201_CREATED,
+        )

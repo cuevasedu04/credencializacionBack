@@ -1,5 +1,10 @@
+from django.conf import settings
 from rest_framework import serializers
-from .models import Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva
+from .models import (
+    Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
+    EnrolamientoCredencial, PlantillaCredencial,
+)
+from . import media_utils
 import base64
 import binascii
 
@@ -135,3 +140,101 @@ class CargaMasivaSerializer(serializers.ModelSerializer):
         model = CargaMasiva
         fields = '__all__'
 
+
+
+# ==========================================================================
+# NUEVO ESQUEMA: foto/firma en disco (MEDIA_ROOT) + plantillas tipo canvas
+# ==========================================================================
+
+class RutaMediaField(serializers.Field):
+    """
+    Campo para foto/firma del nuevo modelo `EnrolamientoCredencial`.
+
+    Lectura  -> URL publica servible por el navegador ('/media/fotos/123.jpg').
+    Escritura-> acepta un data-URI base64 (lo guarda en disco y almacena la ruta),
+                una ruta relativa ya existente, o null para limpiar el campo.
+
+    El nombre del archivo se deriva del num_empleado, por lo que el guardado es
+    deterministico y sobrescribe la version previa del mismo empleado.
+    """
+
+    def __init__(self, carpeta, extensiones, **kwargs):
+        self.carpeta = carpeta
+        self.extensiones = extensiones
+        super().__init__(**kwargs)
+
+    def to_representation(self, value):
+        if not value:
+            return None
+        return media_utils.url_publica(value)
+
+    def to_internal_value(self, data):
+        if data in (None, '', 'null'):
+            return None
+
+        if not isinstance(data, str):
+            raise serializers.ValidationError('Se esperaba una cadena base64 o una ruta.')
+
+        # Ya es una ruta relativa o una URL /media/... que solo hay que normalizar.
+        if not media_utils.es_data_uri(data):
+            ruta = data.replace(settings.MEDIA_URL, '', 1) if data.startswith(settings.MEDIA_URL) else data
+            return ruta.lstrip('/')
+
+        identificador = self._identificador()
+        if not identificador:
+            raise serializers.ValidationError(
+                'Se requiere num_empleado para poder guardar la imagen en disco.'
+            )
+
+        try:
+            return media_utils.guardar_imagen(data, identificador, self.carpeta, self.extensiones)
+        except media_utils.MediaError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def _identificador(self):
+        """num_empleado del payload entrante, o el del registro que se esta editando."""
+        datos = getattr(self.parent, 'initial_data', None) or {}
+        identificador = datos.get('num_empleado')
+
+        if not identificador:
+            instancia = getattr(self.parent, 'instance', None)
+            identificador = getattr(instancia, 'num_empleado', None)
+
+        return identificador
+
+
+class EnrolamientoCredencialSerializer(serializers.ModelSerializer):
+    foto = RutaMediaField(
+        carpeta=settings.MEDIA_DIR_FOTOS,
+        extensiones=media_utils.EXTENSIONES_FOTO,
+        required=False,
+        allow_null=True,
+    )
+    firma = RutaMediaField(
+        carpeta=settings.MEDIA_DIR_FIRMAS,
+        extensiones=media_utils.EXTENSIONES_FIRMA,
+        required=False,
+        allow_null=True,
+    )
+    # Rutas crudas tal cual se guardan en BD, utiles para depurar/migrar.
+    foto_ruta = serializers.CharField(source='foto', read_only=True)
+    firma_ruta = serializers.CharField(source='firma', read_only=True)
+
+    class Meta:
+        model = EnrolamientoCredencial
+        fields = '__all__'
+
+
+class PlantillaCredencialSerializer(serializers.ModelSerializer):
+    fondo_frente_url = serializers.CharField(read_only=True)
+    fondo_reverso_url = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = PlantillaCredencial
+        fields = '__all__'
+
+    def validate_clave(self, value):
+        valor = (value or '').strip().upper().replace(' ', '_')
+        if not valor:
+            raise serializers.ValidationError('La clave de la plantilla es obligatoria.')
+        return valor

@@ -142,6 +142,16 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 
+# Archivos de medios (fotos, firmas y fondos de plantillas de credencial)
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# Subcarpetas dentro de MEDIA_ROOT. Las fotos y firmas historicas ya viven aqui
+# nombradas por num_empleado (ver EnrolamientoCredencial.resolver_archivo_existente).
+MEDIA_DIR_FOTOS = 'fotos'
+MEDIA_DIR_FIRMAS = 'FIRMAS'
+MEDIA_DIR_PLANTILLAS = 'plantillas'
+
 # Configuración CORS
 if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
