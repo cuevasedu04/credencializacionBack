@@ -235,7 +235,19 @@ class SicreTblSig(models.Model):
     estatus = models.CharField(db_column='ESTATUS', max_length=100, blank=True, null=True)
     estado_hum = models.CharField(db_column='ESTADO_HUM', max_length=100, blank=True, null=True)
     estado_nom = models.CharField(db_column='ESTADO_NOM', max_length=100, blank=True, null=True)
+    # Se reescribe en CADA sincronizacion (cada 30 min), para TODOS los
+    # registros -- no distingue "recien llegado" de "ya existia y se
+    # refresco de rutina". Para eso ver fecha_primera_deteccion.
     fecha_actualizacion = models.DateTimeField(db_column='FECHA_ACTUALIZACION', blank=True, null=True)
+    # A diferencia de fecha_actualizacion, esta SOLO se escribe la primera vez
+    # que se ve a este empleado_anam; en sincronizaciones posteriores el
+    # proyecto Control_De_Plazas_Backend la conserva tal cual (no la
+    # sobreescribe). Es lo que permite distinguir altas reales de refrescos
+    # rutinarios -- ver Control_De_Plazas_Backend/plantilla/tasks.py,
+    # _obtener_fechas_primera_deteccion / _leer_csv_poblado_credenciales.
+    fecha_primera_deteccion = models.DateTimeField(
+        db_column='FECHA_PRIMERA_DETECCION', blank=True, null=True
+    )
 
     class Meta:
         managed = True
@@ -297,3 +309,35 @@ class CargaMasiva(models.Model):
 
     class Meta:
         db_table = 'sicre_tbl_carga_masiva'
+
+class ConsecutivoFolio(models.Model):
+    """
+    Contador de folios de credencial, persistido en servidor.
+
+    Vive en BD y no en el navegador a proposito: el folio debe ser unico entre
+    TODAS las estaciones de impresion. Guardarlo en localStorage haria que dos
+    capturistas trabajando en paralelo emitieran credenciales con el mismo
+    folio sin enterarse.
+
+    `clave` permite mas de un contador por si en el futuro se separan series
+    (ANAM / Nuevo Laredo / familiares), aunque hoy solo se usa 'credencial'.
+    `valor` es el PROXIMO folio a emitir, no el ultimo emitido.
+    """
+    id_consecutivo = models.AutoField(primary_key=True)
+    clave = models.CharField(max_length=50, unique=True, default='credencial')
+    valor = models.IntegerField(default=1)
+    # Ceros a la izquierda al formatear: 6 -> '000123'.
+    longitud = models.IntegerField(default=6)
+    fecha_modificacion = models.DateTimeField(auto_now=True)
+    id_usuario_modifica = models.IntegerField(blank=True, null=True)
+
+    class Meta:
+        managed = True
+        db_table = 'sicre_tbl_consecutivo_folio'
+
+    def __str__(self):
+        return f'{self.clave}: {self.formateado()}'
+
+    def formateado(self, valor=None) -> str:
+        numero = self.valor if valor is None else valor
+        return str(numero).zfill(self.longitud or 6)

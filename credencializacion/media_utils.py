@@ -116,6 +116,175 @@ def resolver_firma(identificador) -> str | None:
     return resolver_existente(identificador, carpeta_firmas(), EXTENSIONES_FIRMA)
 
 
+# Los primeros 10 caracteres del RFC y del CURP de una misma persona son
+# IDENTICOS: 4 letras derivadas del nombre + 6 digitos de la fecha de
+# nacimiento (AAMMDD). Lo que cambia es la cola -- el RFC sigue con 3
+# caracteres de homoclave, el CURP con sexo, entidad, consonantes internas,
+# homoclave y digito verificador.
+#
+#   RFC : ZUAA771125 H4A                 (13, o 10 si se omite la homoclave)
+#   CURP: ZUAA771125 HDFXXX01            (18)
+#            ^^^^^^^^^^ mismo prefijo
+#
+# Ese prefijo comun es lo que permite cruzar las capturas de "Enrolamiento
+# previo" (nombradas por RFC, porque a esa persona todavia no se le asigna
+# numero de empleado) con el roster SIG, que solo trae CURP y nunca RFC.
+LONGITUD_PREFIJO_IDENTIDAD = 10
+
+
+def prefijo_identidad(valor) -> str:
+    """Prefijo comun RFC/CURP (10 caracteres, normalizado a mayusculas)."""
+    base = nombre_seguro(valor).upper()
+    return base[:LONGITUD_PREFIJO_IDENTIDAD] if len(base) >= LONGITUD_PREFIJO_IDENTIDAD else ''
+
+
+# Indice prefijo -> nombre de archivo, por carpeta. Recorrer el directorio en
+# cada consulta cuesta ~14 ms con los ~14 300 archivos del acervo real, y
+# resolver_por_prefijo() se invoca en la ruta interactiva de "Imprimir
+# credenciales" (dos veces por empleado seleccionado: foto y firma). El indice
+# se invalida solo comparando el mtime del directorio, que cambia en cuanto se
+# agrega, renombra o borra un archivo -- justo lo que hacen guardar_imagen(),
+# migrar_medios() y borrar().
+_INDICE_PREFIJOS: dict = {}
+
+
+def _indice_por_prefijo(carpeta: str, extensiones) -> dict:
+    directorio = _media_root() / carpeta
+    try:
+        marca = directorio.stat().st_mtime_ns
+    except OSError:
+        return {}
+
+    cacheado = _INDICE_PREFIJOS.get(carpeta)
+    if cacheado and cacheado[0] == marca:
+        return cacheado[1]
+
+    extensiones_validas = {e.lower() for e in extensiones}
+    indice: dict = {}
+
+    try:
+        entradas = list(os.scandir(directorio))
+    except OSError:
+        return {}
+
+    for entrada in entradas:
+        if not entrada.is_file():
+            continue
+        base, _, ext = entrada.name.rpartition('.')
+        if not base or ext.lower() not in extensiones_validas:
+            continue
+        if len(base) < LONGITUD_PREFIJO_IDENTIDAD:
+            continue
+
+        clave = base[:LONGITUD_PREFIJO_IDENTIDAD].upper()
+        previo = indice.get(clave)
+        # Ante varios archivos con el mismo prefijo (en el acervo real solo
+        # ocurre con duplicados de la MISMA persona: 'zalr641127' junto a
+        # 'zalr641127-1'), se conserva el nombre mas corto y, a igual
+        # longitud, el menor alfabeticamente -- es decir, el nombre base sin
+        # sufijos, y siempre el mismo sin importar el orden del scandir.
+        if previo is None or (len(entrada.name), entrada.name) < (len(previo), previo):
+            indice[clave] = entrada.name
+
+    _INDICE_PREFIJOS[carpeta] = (marca, indice)
+    return indice
+
+
+def resolver_por_prefijo(valor, carpeta: str, extensiones) -> str | None:
+    """
+    Busca un archivo cuyo nombre EMPIECE con el prefijo de identidad de
+    `valor` (un CURP o un RFC).
+
+    Necesario porque el nombre exacto del archivo no se puede reconstruir: el
+    acervo tiene la foto guardada con RFC (con o sin homoclave) mientras que
+    el roster SIG solo entrega el CURP, y la homoclave del RFC no es derivable
+    del CURP. Solo el prefijo de 10 caracteres es comun a ambos.
+
+    La comparacion es insensible a mayusculas porque el acervo historico
+    mezcla ambos casos (zuaa771125.jpg y HEHA841115.jpg conviven), mientras
+    que los CURP/RFC capturados llegan siempre en mayusculas.
+    """
+    prefijo = prefijo_identidad(valor)
+    if not prefijo:
+        return None
+
+    nombre = _indice_por_prefijo(carpeta, extensiones).get(prefijo)
+    return f'{carpeta}/{nombre}' if nombre else None
+
+
+def resolver_con_respaldo(identificador_principal, identificador_respaldo, carpeta: str, extensiones):
+    """
+    Resuelve un medio probando, en orden:
+      1. nombre exacto por num_empleado (el canonico),
+      2. nombre exacto por CURP/RFC,
+      3. prefijo de identidad de 10 caracteres (ver resolver_por_prefijo).
+
+    El paso 3 es el que cruza las capturas de "Enrolamiento previo" -- hechas
+    antes de que la persona tuviera numero asignado y por tanto nombradas con
+    su RFC -- contra un roster que solo conoce el CURP.
+
+    Regresa (ruta_relativa, origen) con origen en {'principal', 'respaldo',
+    'prefijo'} o (None, None) si no se encontro nada.
+    """
+    ruta = resolver_existente(identificador_principal, carpeta, extensiones)
+    if ruta:
+        return ruta, 'principal'
+
+    if identificador_respaldo:
+        ruta = resolver_existente(identificador_respaldo, carpeta, extensiones)
+        if ruta:
+            return ruta, 'respaldo'
+
+        ruta = resolver_por_prefijo(identificador_respaldo, carpeta, extensiones)
+        if ruta:
+            return ruta, 'prefijo'
+
+    return None, None
+
+
+def migrar_medios(identificador_destino, identificador_respaldo) -> dict:
+    """
+    Renombra foto y firma que hoy viven bajo un RFC/CURP para que pasen a
+    llamarse por num_empleado, una vez que el movimiento de ingreso ya se
+    aplico y el cruce quedo confirmado. Se dispara al imprimir la credencial.
+
+    Si ya existe un archivo nombrado por num_empleado, ese se respeta y NO se
+    sobreescribe: ya es el canonico. Regresa {'foto': bool, 'firma': bool}
+    indicando que se migro realmente.
+    """
+    resultado = {'foto': False, 'firma': False}
+
+    base_destino = nombre_seguro(identificador_destino)
+    if not base_destino or not identificador_respaldo:
+        return resultado
+
+    for carpeta, extensiones, clave in (
+        (carpeta_fotos(), EXTENSIONES_FOTO, 'foto'),
+        (carpeta_firmas(), EXTENSIONES_FIRMA, 'firma'),
+    ):
+        # Ya existe el canonico: no se toca nada.
+        if resolver_existente(identificador_destino, carpeta, extensiones):
+            continue
+
+        origen = (
+            resolver_existente(identificador_respaldo, carpeta, extensiones)
+            or resolver_por_prefijo(identificador_respaldo, carpeta, extensiones)
+        )
+        if not origen:
+            continue
+
+        ext = origen.rsplit('.', 1)[-1]
+        try:
+            (_media_root() / origen).rename(
+                _media_root() / carpeta / f'{base_destino}.{ext}'
+            )
+            resultado[clave] = True
+        except OSError:
+            pass
+
+    return resultado
+
+
 def _borrar_variantes(directorio: Path, base: str, extensiones) -> None:
     """Elimina versiones previas del mismo identificador con otra extension."""
     for ext in extensiones:
@@ -162,6 +331,93 @@ def guardar_foto(contenido_base64: str, identificador) -> str:
 
 def guardar_firma(contenido_base64: str, identificador) -> str:
     return guardar_imagen(contenido_base64, identificador, carpeta_firmas(), EXTENSIONES_FIRMA)
+
+
+# RFC de persona fisica: 4 letras + 6 digitos (AAMMDD) + 3 de homoclave.
+# La homoclave con frecuencia no se captura, de ahi que sea opcional.
+_RE_RFC = re.compile(r'^[A-ZÑ&]{4}[0-9]{6}([A-Z0-9]{3})?$', re.IGNORECASE)
+# CURP: 4 letras + 6 digitos + H/M + 5 letras + homoclave + digito = 18.
+_RE_CURP = re.compile(r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{6}[HM][A-Z]{5}[A-Z0-9][0-9]$', re.IGNORECASE)
+
+
+def es_rfc(valor) -> bool:
+    return bool(_RE_RFC.match(str(valor or '').strip()))
+
+
+def es_curp(valor) -> bool:
+    return bool(_RE_CURP.match(str(valor or '').strip()))
+
+
+def _es_identificador_previo(base: str) -> bool:
+    """
+    True si el nombre de archivo corresponde a una captura pendiente de
+    cruzarse con un num_empleado, es decir, nombrada por RFC o CURP.
+
+    Los num_empleado del roster SIG son SIEMPRE numericos, asi que basta con
+    exigir que el nombre traiga letras. Esto incluye a proposito los ~950
+    archivos historicos nombrados con RFC corto en minusculas
+    (zuaa771125.jpg): NO son ruido, son justamente capturas previas que
+    todavia no se han cruzado, y el prefijo comun RFC/CURP de 10 caracteres
+    permite cruzarlas igual que las nuevas (ver resolver_por_prefijo).
+    """
+    return bool(base) and not base.isdigit()
+
+
+def listar_enrolamientos_previos() -> list:
+    """
+    Lista las capturas guardadas por CURP que aun no se han cruzado con un
+    num_empleado (ver migrar_medios). Sirve para que "Enrolamiento previo"
+    sepa a quien ya se le tomo foto/firma, incluso despues de recargar la
+    pagina -- no hay tabla en BD que lo registre, la unica fuente de verdad
+    son los archivos en MEDIA_ROOT.
+
+    Regresa una lista de dicts ordenada por fecha de captura descendente.
+    """
+    registros = {}
+
+    for carpeta, extensiones, clave in (
+        (carpeta_fotos(), EXTENSIONES_FOTO, 'foto'),
+        (carpeta_firmas(), EXTENSIONES_FIRMA, 'firma'),
+    ):
+        directorio = _media_root() / carpeta
+        if not directorio.is_dir():
+            continue
+
+        for archivo in directorio.iterdir():
+            if not archivo.is_file():
+                continue
+
+            base = archivo.stem
+            ext = archivo.suffix.lstrip('.')
+            if ext not in extensiones or not _es_identificador_previo(base):
+                continue
+
+            entrada = registros.setdefault(
+                base, {'rfc': base, 'foto': None, 'firma': None, 'fecha': None}
+            )
+            entrada[clave] = url_publica(f'{carpeta}/{archivo.name}')
+
+            try:
+                modificado = archivo.stat().st_mtime
+            except OSError:
+                modificado = None
+            if modificado and (entrada['fecha'] is None or modificado > entrada['fecha']):
+                entrada['fecha'] = modificado
+
+    return sorted(registros.values(), key=lambda r: r['fecha'] or 0, reverse=True)
+
+
+def borrar_medios(identificador) -> dict:
+    """Elimina foto y firma de un identificador. Regresa que se borro."""
+    resultado = {'foto': False, 'firma': False}
+    for carpeta, extensiones, clave in (
+        (carpeta_fotos(), EXTENSIONES_FOTO, 'foto'),
+        (carpeta_firmas(), EXTENSIONES_FIRMA, 'firma'),
+    ):
+        ruta = resolver_existente(identificador, carpeta, extensiones)
+        if ruta:
+            resultado[clave] = borrar(ruta)
+    return resultado
 
 
 def guardar_fondo_plantilla(contenido_base64: str, nombre_archivo: str) -> str:

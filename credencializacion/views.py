@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from .models import (
     Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
-    EnrolamientoCredencial, PlantillaCredencial,
+    EnrolamientoCredencial, PlantillaCredencial, ConsecutivoFolio,
 )
 from .serializers import (
     EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer,
@@ -22,6 +22,7 @@ from rest_framework.views import APIView
 import pandas as pd
 import base64
 import os
+import time
 from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
@@ -2342,24 +2343,58 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='medios')
     def medios(self, request):
-        """Resuelve unicamente las rutas de foto/firma en disco para un num_empleado."""
+        """
+        Resuelve las rutas de foto/firma en disco para un num_empleado y, si
+        no hay nada guardado con ese numero, reintenta con el CURP.
+
+        El respaldo por CURP cubre el "enrolamiento previo": es comun capturar
+        foto/firma de personal cuyo movimiento de ingreso todavia no se aplica
+        en el sistema, por lo que aun no tiene num_empleado asignado. Esas
+        capturas se guardan nombradas por CURP y, en cuanto el roster SIG ya
+        trae a esa persona con numero, este respaldo permite cruzarlas.
+
+        `foto_origen`/`firma_origen` indican con cual identificador se
+        encontro cada archivo ('principal' = num_empleado, 'respaldo' = curp),
+        para que el front sepa si al imprimir hay que migrarlos al nombre
+        definitivo (ver accion migrar-medios-curp).
+        """
         num_empleado = (request.query_params.get('num_empleado') or '').strip()
-        if not num_empleado:
+        # El roster SIG solo trae CURP; se acepta rfc por si quien llama ya lo
+        # tiene a la mano (ambos comparten el prefijo de 10 caracteres que se
+        # usa para el cruce).
+        respaldo = (request.query_params.get('curp') or request.query_params.get('rfc') or '').strip()
+
+        if not num_empleado and not respaldo:
             return Response(
-                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado, curp o rfc.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        ruta_foto = media_utils.resolver_foto(num_empleado)
-        ruta_firma = media_utils.resolver_firma(num_empleado)
+        ruta_foto, origen_foto = media_utils.resolver_con_respaldo(
+            num_empleado, respaldo, media_utils.carpeta_fotos(), media_utils.EXTENSIONES_FOTO
+        )
+        ruta_firma, origen_firma = media_utils.resolver_con_respaldo(
+            num_empleado, respaldo, media_utils.carpeta_firmas(), media_utils.EXTENSIONES_FIRMA
+        )
+
+        origenes_previos = {'respaldo', 'prefijo'}
 
         return Response({
             'status': 'success',
             'num_empleado': num_empleado,
+            'identificador_respaldo': respaldo,
             'foto': media_utils.url_publica(ruta_foto),
             'firma': media_utils.url_publica(ruta_firma),
             'foto_ruta': ruta_foto,
             'firma_ruta': ruta_firma,
+            'foto_origen': origen_foto,
+            'firma_origen': origen_firma,
+            # True si algun medio se encontro por RFC/CURP (enrolamiento
+            # previo) y todavia no se renombra al num_empleado definitivo.
+            'requiere_migracion': bool(
+                num_empleado
+                and (origen_foto in origenes_previos or origen_firma in origenes_previos)
+            ),
             'encontrado': bool(ruta_foto or ruta_firma),
         })
 
@@ -2408,6 +2443,362 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
             'actualizados': actualizados,
             'foto': registro.foto_url,
             'firma': registro.firma_url,
+        })
+
+    @action(detail=False, methods=['post'], url_path='guardar-medios-empleado')
+    def guardar_medios_empleado(self, request):
+        """
+        Guarda foto y/o firma (base64) en MEDIA_ROOT nombradas por
+        num_empleado o, si todavia no tiene numero asignado, por RFC.
+
+        No requiere que exista un registro EnrolamientoCredencial -- la
+        resolucion de medios es puramente por convencion de nombre de
+        archivo (ver media_utils), asi que sirve tanto para un empleado del
+        roster SIG (desde "Imprimir credenciales") como para un enrolamiento
+        previo por RFC, de personal cuyo movimiento de ingreso aun no se
+        aplica y por tanto todavia no tiene num_empleado.
+        """
+        num_empleado = (request.data.get('num_empleado') or '').strip()
+        rfc = (request.data.get('rfc') or request.data.get('curp') or '').strip()
+        identificador = num_empleado or rfc
+
+        if not identificador:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado o rfc.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actualizados = []
+        try:
+            if request.data.get('foto'):
+                media_utils.guardar_foto(request.data['foto'], identificador)
+                actualizados.append('foto')
+
+            if request.data.get('firma'):
+                media_utils.guardar_firma(request.data['firma'], identificador)
+                actualizados.append('firma')
+        except media_utils.MediaError as exc:
+            return Response(
+                {'status': 'error', 'mensaje': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not actualizados:
+            return Response(
+                {'status': 'error', 'mensaje': 'No se recibio foto ni firma.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'status': 'success',
+            'identificador': identificador,
+            'num_empleado': num_empleado,
+            'rfc': rfc,
+            'actualizados': actualizados,
+            'foto': media_utils.url_publica(media_utils.resolver_foto(identificador)),
+            'firma': media_utils.url_publica(media_utils.resolver_firma(identificador)),
+        })
+
+    # Cache del indice del roster. Traer las ~16 400 filas desde la BD remota
+    # tarda ~4 s, y el inventario lo necesita completo. Filtrar en SQL con
+    # LEFT(CURP,10) IN (...) solo baja a ~2.9 s y ademas NO coincide con
+    # prefijo_identidad() -- que normaliza el CURP antes de cortar -- por lo
+    # que el inventario marcaria como cruzables registros que luego la
+    # migracion no encuentra. Se prefiere la version correcta con un cache
+    # corto: el roster solo se actualiza cada 30 min (sync de Celery), asi que
+    # 5 minutos de vigencia no puede devolver datos significativamente viejos.
+    _CACHE_INDICE_ROSTER: dict = {}
+    _CACHE_INDICE_TTL_SEGUNDOS = 300
+
+    def _indice_roster_por_prefijo(self, refrescar=False):
+        """Mapa prefijo de identidad (10 caracteres) -> empleado del roster SIG."""
+        ahora = time.monotonic()
+        cacheado = EnrolamientoCredencialViewSet._CACHE_INDICE_ROSTER
+        if (
+            not refrescar
+            and cacheado.get('indice') is not None
+            and (ahora - cacheado.get('marca', 0)) < self._CACHE_INDICE_TTL_SEGUNDOS
+        ):
+            return cacheado['indice']
+
+        indice = {}
+        filas = (
+            SicreTblSig.objects
+            .exclude(curp__isnull=True).exclude(curp='')
+            .exclude(no_empleado__isnull=True).exclude(no_empleado='')
+            .values('curp', 'no_empleado', 'nombres', 'primer_apellido', 'segundo_apellido')
+        )
+        for fila in filas:
+            prefijo = media_utils.prefijo_identidad(fila['curp'])
+            if prefijo:
+                indice.setdefault(prefijo, fila)
+
+        EnrolamientoCredencialViewSet._CACHE_INDICE_ROSTER = {
+            'indice': indice, 'marca': ahora,
+        }
+        return indice
+
+    @action(detail=False, methods=['get'], url_path='enrolamientos-previos')
+    def enrolamientos_previos(self, request):
+        """
+        Inventario de fotos/firmas nombradas por RFC que todavia no se han
+        renombrado a num_empleado.
+
+        No hay tabla en BD que las registre: los archivos en MEDIA_ROOT son la
+        unica fuente de verdad, por lo que la lista se construye leyendo el
+        directorio.
+
+        A cada archivo se le adjunta `cruce`: el empleado del roster SIG cuyo
+        CURP comparte el prefijo de 10 caracteres con ese RFC. Si viene con
+        cruce, ya se puede renombrar al num_empleado definitivo; si viene en
+        null, esa persona todavia no aparece en el roster (o el nombre del
+        archivo es basura).
+        """
+        registros = media_utils.listar_enrolamientos_previos()
+        indice = self._indice_roster_por_prefijo()
+
+        for registro in registros:
+            empleado = indice.get(media_utils.prefijo_identidad(registro['rfc']))
+            if not empleado:
+                registro['cruce'] = None
+                continue
+
+            nombre = ' '.join(filter(None, [
+                empleado.get('nombres'),
+                empleado.get('primer_apellido'),
+                empleado.get('segundo_apellido'),
+            ])).strip()
+            registro['cruce'] = {
+                'num_empleado': empleado['no_empleado'],
+                'curp': empleado['curp'],
+                'nombre': nombre,
+            }
+
+        return Response({
+            'status': 'success',
+            'registros': registros,
+            'total': len(registros),
+            'cruzables': sum(1 for r in registros if r['cruce']),
+        })
+
+    @action(detail=False, methods=['post'], url_path='migrar-medios-lote')
+    def migrar_medios_lote(self, request):
+        """
+        Renombra en bloque las capturas que ya cruzan con el roster.
+
+        Recibe opcionalmente `rfcs` (lista) para limitar el alcance; sin ella
+        migra todo lo cruzable. El num_empleado destino NUNCA se toma del
+        cliente: se recalcula aqui contra el roster, para que un payload
+        manipulado no pueda asignarle la foto de una persona a otra.
+        """
+        solicitados = request.data.get('rfcs')
+        filtro = {str(r).strip().upper() for r in solicitados} if solicitados else None
+
+        indice = self._indice_roster_por_prefijo()
+        resultados = []
+
+        for registro in media_utils.listar_enrolamientos_previos():
+            rfc = registro['rfc']
+            if filtro is not None and rfc.upper() not in filtro:
+                continue
+
+            empleado = indice.get(media_utils.prefijo_identidad(rfc))
+            if not empleado:
+                continue
+
+            migrados = media_utils.migrar_medios(empleado['no_empleado'], rfc)
+            if migrados['foto'] or migrados['firma']:
+                resultados.append({
+                    'rfc': rfc,
+                    'num_empleado': empleado['no_empleado'],
+                    'migrados': migrados,
+                })
+
+        return Response({
+            'status': 'success',
+            'total_migrados': len(resultados),
+            'resultados': resultados,
+        })
+
+    # ------------------------------------------------------------------
+    # Consecutivo de folio
+    # ------------------------------------------------------------------
+
+    CLAVE_FOLIO_POR_DEFECTO = 'credencial'
+
+    def _obtener_consecutivo(self, clave=None):
+        registro, _ = ConsecutivoFolio.objects.get_or_create(
+            clave=clave or self.CLAVE_FOLIO_POR_DEFECTO
+        )
+        return registro
+
+    @action(detail=False, methods=['get'], url_path='folio-actual')
+    def folio_actual(self, request):
+        """Proximo folio a emitir, sin consumirlo."""
+        consecutivo = self._obtener_consecutivo(request.query_params.get('clave'))
+        return Response({
+            'status': 'success',
+            'clave': consecutivo.clave,
+            'valor': consecutivo.valor,
+            'longitud': consecutivo.longitud,
+            'folio': consecutivo.formateado(),
+        })
+
+    @action(detail=False, methods=['post'], url_path='folio-establecer')
+    def folio_establecer(self, request):
+        """
+        Fija manualmente el proximo folio. Acepta el numero suelto o ya
+        formateado con ceros ('000123'); de la longitud del texto recibido se
+        toma el relleno, para que el operador pueda cambiar de 6 a 7 digitos
+        sin tocar configuracion.
+        """
+        crudo = str(request.data.get('folio', '')).strip()
+        digitos = ''.join(ch for ch in crudo if ch.isdigit())
+        if not digitos:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar un folio numerico.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        consecutivo = self._obtener_consecutivo(request.data.get('clave'))
+        consecutivo.valor = int(digitos)
+        consecutivo.longitud = max(len(digitos), 1)
+        consecutivo.id_usuario_modifica = request.data.get('id_usuario')
+        consecutivo.save(update_fields=[
+            'valor', 'longitud', 'id_usuario_modifica', 'fecha_modificacion',
+        ])
+
+        return Response({
+            'status': 'success',
+            'valor': consecutivo.valor,
+            'longitud': consecutivo.longitud,
+            'folio': consecutivo.formateado(),
+        })
+
+    @action(detail=False, methods=['post'], url_path='folio-consumir')
+    def folio_consumir(self, request):
+        """
+        Entrega el folio actual y avanza el contador, de forma ATOMICA.
+
+        El bloqueo de fila (select_for_update dentro de la transaccion) es lo
+        que impide que dos estaciones imprimiendo a la vez reciban el mismo
+        folio: la segunda espera a que la primera confirme su incremento.
+        Leer y luego escribir sin bloqueo si permitiria esa colision.
+        """
+        clave = request.data.get('clave') or self.CLAVE_FOLIO_POR_DEFECTO
+        # get_or_create fuera de la transaccion: select_for_update exige que la
+        # fila ya exista.
+        self._obtener_consecutivo(clave)
+
+        with transaction.atomic():
+            consecutivo = ConsecutivoFolio.objects.select_for_update().get(clave=clave)
+            emitido = consecutivo.formateado()
+            consecutivo.valor += 1
+            consecutivo.id_usuario_modifica = request.data.get('id_usuario')
+            consecutivo.save(update_fields=[
+                'valor', 'id_usuario_modifica', 'fecha_modificacion',
+            ])
+            siguiente = consecutivo.formateado()
+
+        return Response({
+            'status': 'success',
+            'folio_emitido': emitido,
+            'folio_siguiente': siguiente,
+            'valor': consecutivo.valor,
+            'longitud': consecutivo.longitud,
+        })
+
+    @action(detail=False, methods=['post'], url_path='medios-lote')
+    def medios_lote(self, request):
+        """
+        Resuelve foto/firma de varios RFC de golpe.
+
+        Lo usa "Enrolamiento previo" para reconstruir la sesion tras recargar:
+        el navegador recuerda que RFC lleva capturados y con esto recupera sus
+        URLs. Es deliberadamente barato -- solo toca el sistema de archivos,
+        sin cruzar contra el roster -- a diferencia de `enrolamientos-previos`,
+        que trae las ~16 400 filas del roster para calcular el cruce.
+        """
+        rfcs = request.data.get('rfcs') or []
+        if not isinstance(rfcs, list):
+            return Response(
+                {'status': 'error', 'mensaje': 'rfcs debe ser una lista.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registros = []
+        for valor in rfcs:
+            rfc = str(valor or '').strip()
+            if not rfc:
+                continue
+            ruta_foto = media_utils.resolver_foto(rfc)
+            ruta_firma = media_utils.resolver_firma(rfc)
+            # Sin ningun archivo, esa captura ya no existe en disco (la
+            # borraron desde el inventario, por ejemplo): se omite para que
+            # la sesion no muestre tarjetas fantasma.
+            if not ruta_foto and not ruta_firma:
+                continue
+            registros.append({
+                'rfc': rfc,
+                'foto': media_utils.url_publica(ruta_foto),
+                'firma': media_utils.url_publica(ruta_firma),
+            })
+
+        return Response({'status': 'success', 'registros': registros})
+
+    @action(detail=False, methods=['post'], url_path='borrar-medios-previo')
+    def borrar_medios_previo(self, request):
+        """
+        Elimina foto y firma guardadas por RFC. Necesario para corregir una
+        captura hecha con un RFC mal escrito, que de otro modo quedaria
+        huerfana en disco sin forma de cruzarse nunca.
+        """
+        rfc = (request.data.get('rfc') or request.data.get('curp') or '').strip()
+        if not rfc:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar rfc.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'status': 'success',
+            'rfc': rfc,
+            'borrados': media_utils.borrar_medios(rfc),
+        })
+
+    @action(detail=False, methods=['post'], url_path='migrar-medios')
+    def migrar_medios(self, request):
+        """
+        Renombra foto y firma guardadas por RFC (enrolamiento previo) para que
+        pasen a llamarse por num_empleado, ahora que el movimiento de ingreso
+        ya se aplico y la persona tiene numero asignado.
+
+        El cruce se hace por el prefijo de 10 caracteres comun a RFC y CURP
+        (ver media_utils.resolver_por_prefijo), porque el roster SIG solo
+        entrega CURP y la homoclave del RFC no es derivable de el.
+
+        Se invoca al imprimir la credencial, que es el punto en el que el
+        cruce ya quedo confirmado. Si ya existe un archivo con el
+        num_empleado, ese se respeta y no se sobreescribe.
+        """
+        num_empleado = (request.data.get('num_empleado') or '').strip()
+        respaldo = (request.data.get('curp') or request.data.get('rfc') or '').strip()
+
+        if not num_empleado or not respaldo:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado y curp (o rfc).'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        migrados = media_utils.migrar_medios(num_empleado, respaldo)
+
+        return Response({
+            'status': 'success',
+            'num_empleado': num_empleado,
+            'identificador_respaldo': respaldo,
+            'migrados': migrados,
+            'foto': media_utils.url_publica(media_utils.resolver_foto(num_empleado)),
+            'firma': media_utils.url_publica(media_utils.resolver_firma(num_empleado)),
         })
 
     @action(detail=True, methods=['post'], url_path='marcar-impreso')
