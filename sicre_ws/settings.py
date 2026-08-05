@@ -59,6 +59,10 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    # Comprime las respuestas grandes: el dataset completo del roster SIG
+    # (endpoint empleados-sig/todos/, ~16k registros) pesa ~8 MB en crudo y
+    # baja a ~1 MB comprimido.
+    'django.middleware.gzip.GZipMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',

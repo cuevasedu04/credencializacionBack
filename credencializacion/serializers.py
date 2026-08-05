@@ -148,7 +148,14 @@ class CargaMasivaSerializer(serializers.ModelSerializer):
 
 class RutaMediaField(serializers.Field):
     """
-    Campo para foto/firma del nuevo modelo `EnrolamientoCredencial`.
+    Campo generico para un CharField de ruta relativa dentro de MEDIA_ROOT.
+
+    No esta enganchado a ningun modelo actualmente -- `EnrolamientoCredencial`
+    ya no guarda foto/firma como columna (se resuelven por convencion via
+    media_utils.resolver_foto/resolver_firma, ver EnrolamientoCredencialSerializer
+    mas abajo). Se deja disponible por si se necesita un campo de archivo con
+    esta misma logica de guardado (ej. una futura columna de tipo archivo en
+    PlantillaCredencial u otro modelo).
 
     Lectura  -> URL publica servible por el navegador ('/media/fotos/123.jpg').
     Escritura-> acepta un data-URI base64 (lo guarda en disco y almacena la ruta),
@@ -204,21 +211,20 @@ class RutaMediaField(serializers.Field):
 
 
 class EnrolamientoCredencialSerializer(serializers.ModelSerializer):
-    foto = RutaMediaField(
-        carpeta=settings.MEDIA_DIR_FOTOS,
-        extensiones=media_utils.EXTENSIONES_FOTO,
-        required=False,
-        allow_null=True,
-    )
-    firma = RutaMediaField(
-        carpeta=settings.MEDIA_DIR_FIRMAS,
-        extensiones=media_utils.EXTENSIONES_FIRMA,
-        required=False,
-        allow_null=True,
-    )
-    # Rutas crudas tal cual se guardan en BD, utiles para depurar/migrar.
-    foto_ruta = serializers.CharField(source='foto', read_only=True)
-    firma_ruta = serializers.CharField(source='firma', read_only=True)
+    """
+    `EnrolamientoCredencial` ya no guarda foto/firma como columna (ver
+    docstring del modelo) -- se resuelven en el momento por convencion de
+    nombre de archivo (propiedades foto_url/firma_url del modelo). Para
+    capturar/guardar una foto o firma nueva se usa el action
+    `guardar-medios` del viewset, que escribe directo a MEDIA_ROOT via
+    num_empleado; este serializer no participa en esa escritura.
+
+    Se exponen bajo las claves `foto`/`firma` (no `foto_url`/`firma_url`) a
+    propósito: el editor de plantillas ya consume empleados con esas claves
+    (plantilla-editor.const.ts, campo: 'foto'/'firma').
+    """
+    foto = serializers.CharField(source='foto_url', read_only=True)
+    firma = serializers.CharField(source='firma_url', read_only=True)
 
     class Meta:
         model = EnrolamientoCredencial

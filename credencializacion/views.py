@@ -1421,6 +1421,29 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
 
     REQUIRED_COLUMNS = list(COLUMN_ALIASES.keys())
 
+    @action(detail=False, methods=['get'], url_path='todos')
+    def todos(self, request):
+        """
+        Dataset completo del roster SIG, sin paginar, para filtrado client-side
+        en la pantalla "Imprimir credenciales".
+
+        Usa .values() en vez del serializer porque para ~16k registros es
+        notablemente mas rapido (evita instanciar un modelo y un serializer por
+        fila). El payload ronda los 8 MB sin comprimir, ~1 MB con GZip
+        (GZipMiddleware esta activo en settings.py).
+        """
+        registros = list(
+            SicreTblSig.objects.all()
+            .order_by('nombres', 'primer_apellido')
+            .values()
+        )
+
+        return Response({
+            'status': 'success',
+            'total': len(registros),
+            'registros': registros,
+        })
+
     @staticmethod
     def _normalize_header(value):
         return str(value or '').strip().upper().replace('.', '').replace('-', '_').replace(' ', '_')
@@ -2208,15 +2231,15 @@ class EnrolamientoCredencialPagination(PageNumberPagination):
 
 class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
     """
-    Tabla principal del nuevo editor de credenciales.
-
-    A diferencia de EnrolamientoViewSet, aqui foto/firma son rutas dentro de
-    MEDIA_ROOT y se exponen como URLs servibles ('/media/fotos/123.jpg').
+    Registro de qué pasó al expedir cada credencial (folio, vigencias,
+    plantilla usada, estatus de impresión) -- NO los datos del empleado, que
+    viven en sicre_tbl_sig y se consultan cruzando por num_empleado. Ver
+    docstring del modelo EnrolamientoCredencial.
     """
     queryset = EnrolamientoCredencial.objects.all().order_by('-id_enrolamiento')
     serializer_class = EnrolamientoCredencialSerializer
     filter_backends = [filters.SearchFilter]
-    search_fields = ['num_empleado', 'rfc', 'curp', 'nombre', 'paterno', 'materno']
+    search_fields = ['num_empleado', 'rfc']
     pagination_class = EnrolamientoCredencialPagination
 
     def get_queryset(self):
@@ -2232,16 +2255,8 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
 
         return qs
 
-    def perform_create(self, serializer):
-        instancia = serializer.save()
-        # Si el empleado ya tenia foto/firma historicas en disco, vincularlas.
-        if instancia.resolver_archivo_existente():
-            instancia.save(update_fields=['foto', 'firma'])
-
     def perform_update(self, serializer):
-        instancia = serializer.save(fecha_modificacion=timezone.now())
-        if instancia.resolver_archivo_existente():
-            instancia.save(update_fields=['foto', 'firma'])
+        serializer.save(fecha_modificacion=timezone.now())
 
     @action(detail=False, methods=['get'], url_path='buscar-empleado')
     def buscar_empleado(self, request):
@@ -2261,7 +2276,6 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
 
         registro = EnrolamientoCredencial.objects.filter(num_empleado=num_empleado).first()
         if registro:
-            registro.resolver_archivo_existente(guardar=True)
             return Response({
                 'status': 'success',
                 'origen': 'enrolamiento_credencial',
@@ -2351,7 +2365,11 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='guardar-medios')
     def guardar_medios(self, request, pk=None):
-        """Guarda foto y/o firma (base64) en disco para un registro existente."""
+        """
+        Guarda foto y/o firma (base64) en MEDIA_ROOT, nombradas por
+        num_empleado. No hay ruta que persistir en el modelo -- foto_url/
+        firma_url la resuelven solas en cuanto el archivo existe en disco.
+        """
         registro = self.get_object()
         identificador = registro.num_empleado or request.data.get('num_empleado')
 
@@ -2364,11 +2382,11 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
         actualizados = []
         try:
             if request.data.get('foto'):
-                registro.foto = media_utils.guardar_foto(request.data['foto'], identificador)
+                media_utils.guardar_foto(request.data['foto'], identificador)
                 actualizados.append('foto')
 
             if request.data.get('firma'):
-                registro.firma = media_utils.guardar_firma(request.data['firma'], identificador)
+                media_utils.guardar_firma(request.data['firma'], identificador)
                 actualizados.append('firma')
         except media_utils.MediaError as exc:
             return Response(
@@ -2383,7 +2401,7 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
             )
 
         registro.fecha_modificacion = timezone.now()
-        registro.save(update_fields=actualizados + ['fecha_modificacion'])
+        registro.save(update_fields=['fecha_modificacion'])
 
         return Response({
             'status': 'success',
@@ -2417,6 +2435,57 @@ class PlantillaCredencialViewSet(viewsets.ModelViewSet):
         if activo is not None and str(activo) != '':
             qs = qs.filter(activo=str(activo).lower() in ('1', 'true', 'True'))
         return qs
+
+    @action(detail=False, methods=['get'], url_path='por-defecto')
+    def por_defecto(self, request):
+        """
+        Plantilla que se carga por omision en "Imprimir credenciales".
+
+        Si nadie ha marcado una explicitamente, cae a la primera plantilla
+        activa para que la pantalla siga siendo usable en vez de aparecer
+        vacia.
+        """
+        plantilla = PlantillaCredencial.objects.filter(
+            por_defecto=True, activo=True
+        ).first()
+
+        origen = 'marcada'
+        if not plantilla:
+            plantilla = PlantillaCredencial.objects.filter(activo=True).first()
+            origen = 'primera_activa'
+
+        if not plantilla:
+            return Response(
+                {'status': 'not_found', 'mensaje': 'No hay ninguna plantilla activa.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response({
+            'status': 'success',
+            'origen': origen,
+            'plantilla': PlantillaCredencialSerializer(plantilla).data,
+        })
+
+    @action(detail=True, methods=['post'], url_path='marcar-por-defecto')
+    def marcar_por_defecto(self, request, pk=None):
+        """
+        Marca esta plantilla como la de uso por omision y desmarca cualquier
+        otra, en una sola transaccion para que nunca queden dos marcadas.
+        """
+        plantilla = self.get_object()
+
+        with transaction.atomic():
+            PlantillaCredencial.objects.filter(por_defecto=True).exclude(
+                pk=plantilla.pk
+            ).update(por_defecto=False)
+            plantilla.por_defecto = True
+            plantilla.activo = True  # una plantilla inactiva no puede ser la default
+            plantilla.save(update_fields=['por_defecto', 'activo', 'fecha_modificacion'])
+
+        return Response({
+            'status': 'success',
+            'plantilla': PlantillaCredencialSerializer(plantilla).data,
+        })
 
     @action(detail=False, methods=['post'], url_path='subir-fondo')
     def subir_fondo(self, request):
