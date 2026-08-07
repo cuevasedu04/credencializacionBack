@@ -22,7 +22,7 @@ from rest_framework.routers import DefaultRouter
 from credencializacion.views import (
     EnrolamientoViewSet, SigViewSet, CustomLoginView, EnrolamientoFamiliarViewSet,
     foto_firma_empleado, CargaMasivaViewSet, EnrolamientoCredencialViewSet,
-    PlantillaCredencialViewSet,
+    PlantillaCredencialViewSet, UnidadAdministrativaViewSet,
 )
 
 
@@ -35,6 +35,7 @@ router.register(r'carga-masiva', CargaMasivaViewSet, basename='carga-masiva')
 # Nuevo esquema: enrolamientos con foto/firma en disco + plantillas tipo canvas.
 router.register(r'enrolamiento-credencial', EnrolamientoCredencialViewSet, basename='enrolamiento-credencial')
 router.register(r'plantillas-credencial', PlantillaCredencialViewSet, basename='plantillas-credencial')
+router.register(r'unidades-administrativas', UnidadAdministrativaViewSet, basename='unidades-administrativas')
 
 urlpatterns = [
     path('admin/', admin.site.urls),

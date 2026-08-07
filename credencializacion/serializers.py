@@ -2,7 +2,7 @@ from django.conf import settings
 from rest_framework import serializers
 from .models import (
     Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
-    EnrolamientoCredencial, PlantillaCredencial,
+    EnrolamientoCredencial, PlantillaCredencial, UnidadAdministrativa,
 )
 from . import media_utils
 import base64
@@ -244,3 +244,27 @@ class PlantillaCredencialSerializer(serializers.ModelSerializer):
         if not valor:
             raise serializers.ValidationError('La clave de la plantilla es obligatoria.')
         return valor
+
+
+class UnidadAdministrativaSerializer(serializers.ModelSerializer):
+    """
+    Catalogo de unidades administrativas.
+
+    `nombre_normalizado` se expone solo de lectura: lo calcula el modelo al
+    guardar a partir de `nombre`, y es la clave con la que se cruza contra el
+    campo `area` del roster. Dejarlo editable permitiria romper el cruce sin
+    que se note hasta que una credencial saliera con el area en blanco.
+    """
+    total_empleados = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UnidadAdministrativa
+        fields = [
+            'id_unidad', 'nombre', 'nombre_normalizado', 'nombre_compactado',
+            'activo', 'total_empleados', 'fecha_registro', 'fecha_modificacion',
+        ]
+        read_only_fields = ['nombre_normalizado', 'fecha_registro', 'fecha_modificacion']
+
+    def get_total_empleados(self, obj):
+        # Lo inyecta la vista para no disparar una consulta por fila.
+        return getattr(obj, 'total_empleados', None)

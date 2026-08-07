@@ -1,4 +1,6 @@
 from django.db import models
+import re
+import unicodedata
 
 from . import media_utils
 
@@ -22,21 +24,52 @@ class EnrolamientoCredencial(models.Model):
     # Llave de cruce contra sicre_tbl_sig.NO_EMPLEADO (forma corta, sin ceros a
     # la izquierda -- la misma que usan los ~14,300 archivos de /media).
     num_empleado = models.CharField(max_length=20, blank=True, null=True, db_index=True)
-    rfc = models.CharField(max_length=18)  # sicre_tbl_sig no trae RFC
 
-    inicio_vig = models.DateField(blank=True, null=True)
     fin_vig = models.DateField(blank=True, null=True)
     folio = models.CharField(max_length=50, blank=True, null=True)
     fecha_expedicion = models.DateField(blank=True, null=True)
     provisional = models.IntegerField(db_column='provisional', blank=True, null=True)
-    impreso = models.IntegerField(blank=True, null=True)
 
     # Clave (PlantillaCredencial.clave) de la plantilla con la que se expidio
     # esta credencial -- texto, no FK, por consistencia con el resto del
     # sistema (ver CLAUDE.md, gotcha #9: sin FKs, cruce por valor). Permite
     # reimprimir con la misma plantilla sin que el enrolador tenga que
     # volver a elegirla.
+    # Clave de la PlantillaCredencial usada. Se guarda la CLAVE y no un FK
+    # (el modelo de datos no usa FKs, ver CLAUDE.md) ni una copia del diseno:
+    # lo que interesa es "con que plantilla se le imprimio a esta persona".
     plantilla_credencial = models.CharField(max_length=50, blank=True, null=True)
+
+    # Copia EXACTA del lienzo impreso, SIEMPRE -- no solo cuando hubo ajustes.
+    #
+    # Guardar unicamente la clave de la plantilla no basta para auditar: las
+    # plantillas son editables desde `/plantillas`, asi que reconstruir una
+    # credencial de hace seis meses con la plantilla de hoy mostraria un
+    # documento que nunca existio. El snapshot congela texto, posiciones,
+    # tipografias y fondo tal como salieron impresos.
+    #
+    # Las imagenes (foto, firma, fondo) NO se embeben en el JSON: se archivan
+    # aparte en `media/historico/` nombradas por el hash de su contenido, y
+    # aqui solo queda la referencia. Ver `media_utils.archivar_medio`. Medido:
+    # embeberlas costaria ~250 KB por fila (~4 GB en 16 400 impresiones)
+    # contra ~47 KB referenciandolas, y el archivo deduplica las reimpresiones.
+    #
+    # Los objetos conservan su `data.binding`, asi que al REIMPRIMIR se vuelven
+    # a poblar con datos frescos (folio y fecha nuevos) sin perder las
+    # posiciones ajustadas. La auditoria, en cambio, dibuja el JSON tal cual,
+    # sin repoblar nada.
+    canvas_frente = models.JSONField(blank=True, null=True)
+    canvas_reverso = models.JSONField(blank=True, null=True)
+
+    # ¿El operador movio/edito algo a mano antes de imprimir?
+    #
+    # Antes esto se deducia de "hay canvas guardado", pero desde que el
+    # snapshot se guarda SIEMPRE esa señal dejo de existir y hubo que hacerla
+    # explicita. Importa porque "Imprimir credenciales" solo restaura el
+    # lienzo guardado cuando hubo ajustes: si lo restaurara siempre, una
+    # credencial impresa limpia dejaria de seguir a su plantilla y los
+    # cambios de diseño nunca llegarian a las reimpresiones.
+    con_ajustes = models.BooleanField(default=False)
 
     # Auditoria
     fecha_registro = models.DateTimeField(auto_now_add=True, blank=True, null=True)
@@ -48,11 +81,13 @@ class EnrolamientoCredencial(models.Model):
     class Meta:
         managed = True
         db_table = 'sicre_tbl_enrolamiento_credencial'
+        # Una fila POR IMPRESION: el historial es cronologico y auditable.
+        ordering = ['-fecha_registro']
         verbose_name = 'Enrolamiento (credencial)'
         verbose_name_plural = 'Enrolamientos (credencial)'
 
     def __str__(self):
-        return f"{self.num_empleado or self.rfc} (folio {self.folio or 's/n'})"
+        return f"{self.num_empleado or 's/n'} (folio {self.folio or 's/n'})"
 
     # ---- Ayudas de medios (resueltas por convencion, nunca persistidas) ----
 
@@ -341,3 +376,81 @@ class ConsecutivoFolio(models.Model):
     def formateado(self, valor=None) -> str:
         numero = self.valor if valor is None else valor
         return str(numero).zfill(self.longitud or 6)
+
+
+class UnidadAdministrativa(models.Model):
+    """
+    Catalogo de unidades administrativas con su nombre corto, para imprimir
+    en la credencial.
+
+    El campo `area` del roster SIG trae el nombre oficial completo, que llega
+    a 90 caracteres ("Aduana del Aeropuerto Internacional de la Ciudad de
+    Mexico con sede en la Ciudad de Mexico") y desborda o tapa otros campos
+    del gafete. Aqui se guarda su equivalente compacto ("AICM").
+
+    `nombre_normalizado` es la clave real de cruce y NO es redundante: el
+    roster escribe el area en MAYUSCULAS ("UNIDAD DE ADMINISTRACION Y
+    FINANZAS") mientras que el catalogo de origen viene en Title Case
+    ("Unidad de Administracion y Finanzas"). Comprobado contra los datos
+    reales: cruzando por el texto crudo empatan 0 de 16 431 empleados;
+    normalizando, empatan los 16 431.
+    """
+    id_unidad = models.AutoField(primary_key=True)
+    nombre = models.CharField(max_length=255)
+    nombre_normalizado = models.CharField(max_length=255, unique=True, db_index=True)
+    # Texto EXACTO que se imprime en la credencial. Las Direcciones Generales
+    # llevan su acronimo (DGTI, UAF...) y las aduanas llevan 'ANAM'. Se guarda
+    # ya resuelto, sin banderas ni reglas en codigo, para que el catalogo sea
+    # editable desde la pantalla de Catalogos: si manana quieren que una
+    # aduana imprima su propio nombre, lo escriben ahi y funciona, sin tocar
+    # el sistema.
+    nombre_compactado = models.CharField(max_length=100)
+    activo = models.BooleanField(default=True)
+    fecha_registro = models.DateTimeField(auto_now_add=True)
+    fecha_modificacion = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = 'sicre_cat_unidad_compactada'
+        ordering = ['nombre']
+
+    # Valor por omision para las unidades que no son Direccion General.
+    NOMBRE_GENERICO = 'ANAM'
+
+    def __str__(self):
+        return f'{self.nombre} -> {self.nombre_compactado}'
+
+    @classmethod
+    def compactar(cls, area) -> str:
+        """
+        Nombre corto que se imprime para un area del roster.
+
+        Si el area no esta en el catalogo devuelve el nombre completo: texto
+        largo y apretado en la credencial es preferible a un campo vacio, y
+        el hueco se detecta aparte en la pantalla de Catalogos.
+        """
+        texto = str(area or '').strip()
+        if not texto:
+            return ''
+        registro = cls.objects.filter(
+            nombre_normalizado=cls.normalizar(texto), activo=True
+        ).only('nombre_compactado').first()
+        return registro.nombre_compactado if registro else texto
+
+    @staticmethod
+    def normalizar(valor) -> str:
+        """
+        Clave de cruce: mayusculas, sin acentos y sin puntuacion.
+
+        Quitar los acentos ademas de subir a mayusculas cubre las variantes
+        del acervo ("MEXICO" vs "MEXICO"), y colapsar todo lo que no sea
+        alfanumerico absorbe dobles espacios y puntos finales, que aparecen
+        de forma inconsistente entre ambas fuentes.
+        """
+        texto = unicodedata.normalize('NFD', str(valor or '').upper())
+        texto = ''.join(c for c in texto if unicodedata.category(c) != 'Mn')
+        return re.sub(r'[^A-Z0-9]+', ' ', texto).strip()
+
+    def save(self, *args, **kwargs):
+        self.nombre_normalizado = self.normalizar(self.nombre)
+        super().save(*args, **kwargs)

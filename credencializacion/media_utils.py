@@ -11,9 +11,11 @@ de un archivo existente prueba varias extensiones antes de rendirse.
 """
 import base64
 import binascii
+import hashlib
 import os
 import re
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from django.conf import settings
 
@@ -296,7 +298,46 @@ def _borrar_variantes(directorio: Path, base: str, extensiones) -> None:
                 pass
 
 
-def guardar_imagen(contenido_base64: str, identificador, carpeta: str, extensiones) -> str:
+def convertir_a_png(contenido: bytes) -> bytes:
+    """
+    Reescribe cualquier imagen como PNG, SIN redimensionar.
+
+    PNG es sin perdida: reguardar una foto no la degrada cada vez que se
+    corrige, cosa que con JPEG si pasa. Las firmas ademas dependen de ello --
+    en el acervo real vienen en modo RGBA, y aplanar el canal alfa las dejaria
+    con fondo negro sobre la credencial.
+
+    Las dimensiones se conservan tal cual: la resolucion la define la camara,
+    no el sistema.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        # Sin Pillow se guarda el original: peor formato, pero nunca perder
+        # la captura que el operador acaba de tomar.
+        return contenido
+
+    from io import BytesIO
+    try:
+        with Image.open(BytesIO(contenido)) as imagen:
+            # 'P' (paleta) puede llevar transparencia; se pasa a RGBA para no
+            # perderla. El resto conserva su modo: RGB sigue RGB.
+            if imagen.mode in ('P', 'LA'):
+                imagen = imagen.convert('RGBA')
+            elif imagen.mode not in ('RGB', 'RGBA', 'L'):
+                imagen = imagen.convert('RGB')
+
+            salida = BytesIO()
+            imagen.save(salida, format='PNG', optimize=True)
+            return salida.getvalue()
+    except Exception:
+        return contenido
+
+
+def guardar_imagen(
+    contenido_base64: str, identificador, carpeta: str, extensiones,
+    forzar_png: bool = False,
+) -> str:
     """
     Guarda una imagen base64 en MEDIA_ROOT/<carpeta>/<identificador>.<ext>.
 
@@ -312,6 +353,10 @@ def guardar_imagen(contenido_base64: str, identificador, carpeta: str, extension
     if not contenido:
         raise MediaError('La imagen recibida esta vacia.')
 
+    # Solo se fuerza PNG donde hace falta (firmas). Ver guardar_foto/guardar_firma.
+    if forzar_png:
+        contenido = convertir_a_png(contenido)
+
     directorio = _media_root() / carpeta
     directorio.mkdir(parents=True, exist_ok=True)
 
@@ -326,11 +371,30 @@ def guardar_imagen(contenido_base64: str, identificador, carpeta: str, extension
 
 
 def guardar_foto(contenido_base64: str, identificador) -> str:
+    """
+    Guarda la foto RESPETANDO su formato de origen.
+
+    No se convierte a PNG a proposito: el acervo real son 14 312 fotos JPEG de
+    ~88 KB, y reguardarlas en PNG las multiplica por ~9 (34 KB -> 308 KB
+    medido). La camara ya entrega el formato y la resolucion adecuados; el
+    sistema solo tiene que no estropearlos.
+    """
     return guardar_imagen(contenido_base64, identificador, carpeta_fotos(), EXTENSIONES_FOTO)
 
 
 def guardar_firma(contenido_base64: str, identificador) -> str:
-    return guardar_imagen(contenido_base64, identificador, carpeta_firmas(), EXTENSIONES_FIRMA)
+    """
+    Guarda la firma SIEMPRE como PNG.
+
+    Aqui si hace falta: las firmas del acervo vienen en modo RGBA y su fondo
+    transparente es lo que permite montarlas sobre la credencial. Un JPEG no
+    tiene canal alfa, asi que convertirlas a ese formato las dejaria con
+    fondo negro sobre el gafete.
+    """
+    return guardar_imagen(
+        contenido_base64, identificador, carpeta_firmas(), EXTENSIONES_FIRMA,
+        forzar_png=True,
+    )
 
 
 # RFC de persona fisica: 4 letras + 6 digitos (AAMMDD) + 3 de homoclave.
@@ -363,15 +427,16 @@ def _es_identificador_previo(base: str) -> bool:
     return bool(base) and not base.isdigit()
 
 
-def listar_enrolamientos_previos() -> list:
+def listar_medios_por_identificador(solo_numericos: bool) -> dict:
     """
-    Lista las capturas guardadas por CURP que aun no se han cruzado con un
-    num_empleado (ver migrar_medios). Sirve para que "Enrolamiento previo"
-    sepa a quien ya se le tomo foto/firma, incluso despues de recargar la
-    pagina -- no hay tabla en BD que lo registre, la unica fuente de verdad
-    son los archivos en MEDIA_ROOT.
+    Recorre fotos/ y FIRMAS/ y agrupa los archivos por nombre.
 
-    Regresa una lista de dicts ordenada por fecha de captura descendente.
+    `solo_numericos=True` devuelve los nombrados por num_empleado; False, los
+    nombrados por RFC/CURP (pendientes de cruce). Es la misma pasada de disco
+    para ambos casos, solo cambia el filtro.
+
+    Regresa {identificador: {'identificador', 'foto', 'firma', 'fecha'}} con
+    URLs publicas ya resueltas.
     """
     registros = {}
 
@@ -383,28 +448,95 @@ def listar_enrolamientos_previos() -> list:
         if not directorio.is_dir():
             continue
 
-        for archivo in directorio.iterdir():
-            if not archivo.is_file():
+        validas = {e.lower() for e in extensiones}
+        try:
+            entradas = list(os.scandir(directorio))
+        except OSError:
+            continue
+
+        for entrada in entradas:
+            if not entrada.is_file():
+                continue
+            base, _, ext = entrada.name.rpartition('.')
+            if not base or ext.lower() not in validas:
+                continue
+            # isdigit() distingue num_empleado (siempre numerico) de RFC/CURP
+            # (siempre con letras). Es el mismo criterio que usa el cruce.
+            if base.isdigit() != solo_numericos:
                 continue
 
-            base = archivo.stem
-            ext = archivo.suffix.lstrip('.')
-            if ext not in extensiones or not _es_identificador_previo(base):
-                continue
-
-            entrada = registros.setdefault(
-                base, {'rfc': base, 'foto': None, 'firma': None, 'fecha': None}
+            item = registros.setdefault(
+                base, {'identificador': base, 'foto': None, 'firma': None, 'fecha': None}
             )
-            entrada[clave] = url_publica(f'{carpeta}/{archivo.name}')
-
+            item[clave] = url_publica(f'{carpeta}/{entrada.name}', versionada=True)
             try:
-                modificado = archivo.stat().st_mtime
+                modificado = entrada.stat().st_mtime
             except OSError:
                 modificado = None
-            if modificado and (entrada['fecha'] is None or modificado > entrada['fecha']):
-                entrada['fecha'] = modificado
+            if modificado and (item['fecha'] is None or modificado > item['fecha']):
+                item['fecha'] = modificado
 
+    return registros
+
+
+def listar_enrolamientos_previos() -> list:
+    """
+    Capturas nombradas por RFC/CURP que aun no se cruzan con un num_empleado.
+    Ordenadas por fecha de captura descendente.
+    """
+    registros = listar_medios_por_identificador(solo_numericos=False)
+    for item in registros.values():
+        item['rfc'] = item.pop('identificador')
     return sorted(registros.values(), key=lambda r: r['fecha'] or 0, reverse=True)
+
+
+def renombrar_medios(identificador_actual, identificador_nuevo) -> dict:
+    """
+    Renombra foto y firma de un identificador a otro.
+
+    Sirve para corregir una captura guardada con el RFC mal escrito: mientras
+    el nombre este mal, "Imprimir credenciales" no la encuentra al cruzar.
+
+    NO sobreescribe: si el destino ya tiene archivo, se aborta y se informa.
+    Pisar en silencio la foto de otra persona seria mucho peor que fallar.
+    """
+    origen_base = nombre_seguro(identificador_actual)
+    destino_base = nombre_seguro(identificador_nuevo)
+
+    if not origen_base or not destino_base:
+        raise MediaError('Se requieren el nombre actual y el nuevo.')
+    if origen_base == destino_base:
+        raise MediaError('El nombre nuevo es igual al actual.')
+
+    plan = []
+    for carpeta, extensiones, clave in (
+        (carpeta_fotos(), EXTENSIONES_FOTO, 'foto'),
+        (carpeta_firmas(), EXTENSIONES_FIRMA, 'firma'),
+    ):
+        if resolver_existente(destino_base, carpeta, extensiones):
+            raise MediaError(
+                f'Ya existe un archivo de {clave} con el nombre "{destino_base}". '
+                'Revisa ese registro antes de renombrar.'
+            )
+        origen = resolver_existente(origen_base, carpeta, extensiones)
+        if origen:
+            plan.append((carpeta, origen, clave))
+
+    if not plan:
+        raise MediaError(f'No hay archivos guardados con el nombre "{origen_base}".')
+
+    resultado = {'foto': False, 'firma': False}
+    for carpeta, origen, clave in plan:
+        ext = origen.rsplit('.', 1)[-1]
+        try:
+            (_media_root() / origen).rename(
+                _media_root() / carpeta / f'{destino_base}.{ext}'
+            )
+            resultado[clave] = True
+        except OSError as exc:
+            raise MediaError(f'No se pudo renombrar el archivo de {clave}: {exc}') from exc
+
+    return resultado
 
 
 def borrar_medios(identificador) -> dict:
@@ -447,11 +579,36 @@ def existe(ruta_relativa) -> bool:
     return (_media_root() / str(ruta_relativa)).is_file()
 
 
-def url_publica(ruta_relativa) -> str | None:
-    """Convierte 'fotos/123.jpg' en '/media/fotos/123.jpg'."""
+def url_publica(ruta_relativa, versionada=True) -> str | None:
+    """
+    Convierte 'fotos/123.jpg' en '/media/fotos/123.jpg?v=<mtime>'.
+
+    El versionado va ACTIVADO por omision, no como opcion: los archivos se
+    guardan siempre en la MISMA ruta determinista, asi que al reemplazar una
+    foto la URL no cambia, el navegador la sirve de su cache y parece que el
+    cambio no se guardo. Ya paso: con el respaldo desactivado por defecto se
+    versionaba el inventario pero no el endpoint `medios/`, y la credencial
+    seguia mostrando la firma vieja varios minutos.
+
+    Solo la extension delataba el cambio -- una foto .jpg reemplazada por .png
+    si cambiaba de URL, una firma .png -> .png nunca --, lo que hacia que el
+    fallo pareciera aleatorio.
+
+    Con la marca de tiempo la URL cambia justo cuando cambia el contenido, y
+    sigue cacheando mientras no cambie.
+    """
     if not ruta_relativa:
         return None
-    return f"{settings.MEDIA_URL}{str(ruta_relativa).lstrip('/')}"
+
+    url = f"{settings.MEDIA_URL}{str(ruta_relativa).lstrip('/')}"
+    if not versionada:
+        return url
+
+    try:
+        marca = int((_media_root() / str(ruta_relativa)).stat().st_mtime)
+    except OSError:
+        return url
+    return f'{url}?v={marca}'
 
 
 def leer_como_data_uri(ruta_relativa) -> str | None:
@@ -471,6 +628,114 @@ def leer_como_data_uri(ruta_relativa) -> str | None:
     ext = detectar_extension(contenido)
     mime = 'image/jpeg' if ext in ('jpg', 'jpeg') else f'image/{ext}'
     return f'data:{mime};base64,{base64.b64encode(contenido).decode("ascii")}'
+
+
+# ========================================================================
+# Archivo historico de medios (para la auditoria de credenciales)
+# ========================================================================
+
+CARPETA_HISTORICO = 'historico'
+
+
+def carpeta_historico() -> str:
+    return CARPETA_HISTORICO
+
+
+def ruta_relativa_desde_url(valor) -> str | None:
+    """
+    Extrae la ruta relativa a MEDIA_ROOT de una URL de medios.
+
+    Acepta las tres formas que produce el frontend:
+        'http://host:4200/media/fotos/123.png?v=1786056998'
+        '/media/FIRMAS/123.png'
+        'fotos/123.png'
+
+    Regresa None para data-URIs y para cualquier URL que no cuelgue de
+    MEDIA_URL -- de otro modo se intentaria archivar algo que no es un medio
+    nuestro.
+    """
+    if not valor:
+        return None
+
+    texto = str(valor)
+    if texto.startswith('data:'):
+        return None
+
+    # Quitar esquema+host y la cadena de version (?v=<mtime>).
+    partes = urlsplit(texto)
+    ruta = unquote(partes.path or texto)
+
+    prefijo = settings.MEDIA_URL          # normalmente '/media/'
+    if prefijo and prefijo in ruta:
+        ruta = ruta.split(prefijo, 1)[1]
+    elif ruta.startswith('/'):
+        # Ruta absoluta que no cuelga de MEDIA_URL: no es un medio nuestro.
+        return None
+
+    ruta = ruta.lstrip('/')
+    if not ruta or '..' in ruta.split('/'):
+        return None
+    return ruta
+
+
+def archivar_medio(ruta_relativa) -> str | None:
+    """
+    Copia un archivo de MEDIA_ROOT al archivo historico y regresa su nueva
+    ruta relativa, o None si no existe.
+
+    El destino se nombra por el SHA-256 de su CONTENIDO
+    (`historico/<aa>/<hash>.<ext>`), lo que da tres propiedades que aqui
+    importan:
+
+    - **Inmutabilidad**: la ruta identifica unos bytes concretos. Si manana
+      reemplazan la foto del empleado, la credencial ya impresa sigue
+      apuntando a la imagen con la que REALMENTE se expidio. Sin esto la
+      auditoria mostraria la foto actual sobre un folio viejo, que es
+      justamente la mentira que una auditoria no puede contar.
+    - **Deduplicacion**: reimprimir a la misma persona con la misma foto no
+      cuesta un byte extra, porque el destino ya existe.
+    - **Idempotencia**: archivar dos veces es una sola copia.
+
+    El subdirectorio de dos caracteres evita meter decenas de miles de
+    archivos en un solo directorio, que degrada el listado en la mayoria de
+    sistemas de archivos.
+    """
+    if not ruta_relativa:
+        return None
+
+    origen = _media_root() / str(ruta_relativa)
+    if not origen.is_file():
+        return None
+
+    # Ya archivado: no volver a copiar (evita historico/<x>/historico/<y>).
+    if str(ruta_relativa).startswith(f'{CARPETA_HISTORICO}/'):
+        return str(ruta_relativa)
+
+    try:
+        contenido = origen.read_bytes()
+    except OSError:
+        return None
+
+    digest = hashlib.sha256(contenido).hexdigest()
+    ext = detectar_extension(contenido) or (origen.suffix.lstrip('.') or 'bin')
+
+    relativa = f'{CARPETA_HISTORICO}/{digest[:2]}/{digest}.{ext}'
+    destino = _media_root() / relativa
+
+    if destino.is_file():
+        return relativa
+
+    try:
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        # Escribir a un temporal y renombrar: si dos impresiones concurrentes
+        # archivan el mismo archivo, ninguna lee uno a medio escribir.
+        temporal = destino.with_suffix(destino.suffix + '.tmp')
+        temporal.write_bytes(contenido)
+        os.replace(temporal, destino)
+    except OSError:
+        return None
+
+    return relativa
 
 
 def borrar(ruta_relativa) -> bool:

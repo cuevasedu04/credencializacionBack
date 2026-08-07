@@ -6,11 +6,13 @@ from rest_framework.pagination import PageNumberPagination
 from .models import (
     Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
     EnrolamientoCredencial, PlantillaCredencial, ConsecutivoFolio,
+    UnidadAdministrativa,
 )
 from .serializers import (
     EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer,
     ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer,
     CargaMasivaSerializer, EnrolamientoCredencialSerializer, PlantillaCredencialSerializer,
+    UnidadAdministrativaSerializer,
 )
 from . import media_utils
 from django.conf import settings
@@ -23,6 +25,7 @@ import pandas as pd
 import base64
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
@@ -1439,6 +1442,31 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
             .values()
         )
 
+        # Nombre corto del area, resuelto aqui y no en el front: el catalogo
+        # son 66 filas y el cruce es un diccionario en memoria, mucho mas
+        # barato que una segunda peticion desde el navegador. Ademas la
+        # equivalencia queda en un solo lugar.
+        #
+        # El cruce va por nombre NORMALIZADO: el roster escribe el area en
+        # mayusculas y el catalogo en Title Case, asi que por texto crudo no
+        # empata ni una sola fila (comprobado: 0 de 16 431).
+        #
+        # El catalogo guarda ya resuelto el texto que se imprime (las aduanas
+        # traen 'ANAM'), asi que aqui no hay ninguna regla: lo que diga la
+        # tabla es lo que sale en la credencial. Eso es lo que permite que se
+        # edite desde la pantalla de Catalogos sin tocar codigo.
+        catalogo = dict(
+            UnidadAdministrativa.objects
+            .filter(activo=True)
+            .values_list('nombre_normalizado', 'nombre_compactado')
+        )
+
+        for registro in registros:
+            area = registro.get('area')
+            registro['area_compactada'] = (
+                catalogo.get(UnidadAdministrativa.normalizar(area)) if area else None
+            )
+
         return Response({
             'status': 'success',
             'total': len(registros),
@@ -2240,7 +2268,7 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
     queryset = EnrolamientoCredencial.objects.all().order_by('-id_enrolamiento')
     serializer_class = EnrolamientoCredencialSerializer
     filter_backends = [filters.SearchFilter]
-    search_fields = ['num_empleado', 'rfc']
+    search_fields = ['num_empleado', 'folio']
     pagination_class = EnrolamientoCredencialPagination
 
     def get_queryset(self):
@@ -2320,8 +2348,12 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
                     'materno': sig.segundo_apellido,
                     'apellidos': f"{sig.primer_apellido or ''} {sig.segundo_apellido or ''}".strip(),
                     'puesto': sig.cargo,
-                    'area': sig.area,
-                    'adscripcion': sig.area,
+                    # Se imprime el nombre CORTO del area (catalogo
+                    # sicre_cat_unidad_compactada); el oficial completo queda
+                    # en area_completa por si alguna plantilla lo necesita.
+                    'area': UnidadAdministrativa.compactar(sig.area),
+                    'adscripcion': UnidadAdministrativa.compactar(sig.area),
+                    'area_completa': sig.area,
                     'fecha_expedicion': sig.fecha_expedicion,
                 }
 
@@ -2340,6 +2372,243 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
         datos['firma_ruta'] = ruta_firma
 
         return Response({'status': 'success', 'origen': origen, 'datos': datos})
+
+    @action(detail=False, methods=['post'], url_path='registrar-impresion')
+    def registrar_impresion(self, request):
+        """
+        Deja constancia de una credencial impresa. UNA FILA POR IMPRESION.
+
+        Solo lo llama "Imprimir credenciales" despues de generar el PDF, no al
+        seleccionar un empleado: de otro modo la tabla acumularia una fila por
+        cada uno de los 16 000 registros que alguien abra, y dejaria de ser un
+        historial para volverse una copia del roster.
+
+        Los datos personales del roster NO se copian como columnas: viven en
+        sicre_tbl_sig y se cruzan por num_empleado. Lo que si queda congelado
+        es el LIENZO impreso (ver `_congelar_snapshot`), que es lo unico que
+        permite reproducir despues la credencial exacta que se expidio ese dia.
+        """
+        num_empleado = (request.data.get('num_empleado') or '').strip()
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registro = EnrolamientoCredencial.objects.create(
+            num_empleado=num_empleado,
+            folio=(request.data.get('folio') or None),
+            fecha_expedicion=request.data.get('fecha_expedicion') or timezone.now().date(),
+            fin_vig=request.data.get('fin_vig') or None,
+            plantilla_credencial=(request.data.get('plantilla_credencial') or None),
+            # Snapshot de AMBAS caras, siempre. Sus imagenes quedan archivadas
+            # en media/historico/ para que nadie las pueda reemplazar despues.
+            canvas_frente=_congelar_snapshot(request.data.get('canvas_frente')),
+            canvas_reverso=_congelar_snapshot(request.data.get('canvas_reverso')),
+            con_ajustes=bool(request.data.get('con_ajustes')),
+            activo=1,
+            id_usuario_registra=request.data.get('id_usuario'),
+        )
+
+        return Response(
+            {'status': 'success', 'id_enrolamiento': registro.id_enrolamiento},
+            status=status.HTTP_201_CREATED,
+        )
+
+    # ----------------------------------------------------------------
+    # Auditoria de credenciales impresas
+    # ----------------------------------------------------------------
+
+    @action(detail=False, methods=['get'], url_path='auditoria')
+    def auditoria(self, request):
+        """
+        Historial completo de credenciales impresas, para la pantalla de
+        auditoria. Una fila por impresion.
+
+        NO trae los lienzos: pesan ~47 KB cada uno y la pantalla solo los
+        necesita al abrir una credencial concreta (ver `auditoria-detalle`).
+        Traerlos aqui haria que listar 16 000 impresiones moviera 750 MB.
+        Con `defer` la fila queda en ~200 bytes, asi que el listado completo
+        cabe en memoria del navegador y el filtrado es instantaneo, igual que
+        el roster de "Imprimir credenciales".
+
+        Los datos personales se resuelven contra el roster (cacheado 5 min):
+        el historial guarda num_empleado, no una copia del nombre.
+        """
+        empleados = self._indice_empleados()
+
+        registros = (
+            EnrolamientoCredencial.objects
+            .defer('canvas_frente', 'canvas_reverso')
+            .order_by('-fecha_registro')
+        )
+
+        desde = (request.query_params.get('desde') or '').strip()
+        hasta = (request.query_params.get('hasta') or '').strip()
+        if desde:
+            registros = registros.filter(fecha_registro__date__gte=desde)
+        if hasta:
+            registros = registros.filter(fecha_registro__date__lte=hasta)
+
+        filas = []
+        for r in registros:
+            empleado = empleados.get((r.num_empleado or '').strip()) or {}
+            nombre = ' '.join(filter(None, [
+                (empleado.get('nombres') or '').strip(),
+                (empleado.get('primer_apellido') or '').strip(),
+                (empleado.get('segundo_apellido') or '').strip(),
+            ]))
+            filas.append({
+                'id_enrolamiento': r.id_enrolamiento,
+                'num_empleado': r.num_empleado,
+                'nombre': nombre,
+                'curp': (empleado.get('curp') or '').strip(),
+                'area': (empleado.get('area') or '').strip(),
+                'folio': r.folio,
+                'fecha_expedicion': r.fecha_expedicion,
+                'fin_vig': r.fin_vig,
+                'plantilla_credencial': r.plantilla_credencial,
+                'con_ajustes': bool(r.con_ajustes),
+                'fecha_registro': r.fecha_registro,
+            })
+
+        return Response({
+            'status': 'success',
+            'total': len(filas),
+            'resultados': filas,
+        })
+
+    @action(detail=False, methods=['get'], url_path='auditoria-detalle')
+    def auditoria_detalle(self, request):
+        """
+        Lienzos congelados de UNA impresion, para reproducirla en pantalla.
+
+        Se pide por separado del listado justamente porque es lo pesado. Si la
+        impresion es anterior a que se guardara el snapshot, `canvas_frente`
+        viene vacio y la pantalla lo informa en vez de dibujar una credencial
+        reconstruida (que seria una suposicion, no un registro).
+        """
+        try:
+            id_enrolamiento = int(request.query_params.get('id') or 0)
+        except (TypeError, ValueError):
+            id_enrolamiento = 0
+
+        if not id_enrolamiento:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar id.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registro = EnrolamientoCredencial.objects.filter(
+            id_enrolamiento=id_enrolamiento
+        ).first()
+        if not registro:
+            return Response(
+                {'status': 'error', 'mensaje': 'No existe esa impresion.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        empleado = self._indice_empleados().get((registro.num_empleado or '').strip()) or {}
+        nombre = ' '.join(filter(None, [
+            (empleado.get('nombres') or '').strip(),
+            (empleado.get('primer_apellido') or '').strip(),
+            (empleado.get('segundo_apellido') or '').strip(),
+        ]))
+
+        return Response({
+            'status': 'success',
+            'id_enrolamiento': registro.id_enrolamiento,
+            'num_empleado': registro.num_empleado,
+            'nombre': nombre,
+            'folio': registro.folio,
+            'fecha_expedicion': registro.fecha_expedicion,
+            'fin_vig': registro.fin_vig,
+            'plantilla_credencial': registro.plantilla_credencial,
+            'con_ajustes': bool(registro.con_ajustes),
+            'fecha_registro': registro.fecha_registro,
+            'tiene_snapshot': bool(registro.canvas_frente),
+            'canvas_frente': registro.canvas_frente,
+            'canvas_reverso': registro.canvas_reverso,
+        })
+
+    @action(detail=False, methods=['get'], url_path='auditoria-empleado')
+    def auditoria_empleado(self, request):
+        """
+        Todas las impresiones de un empleado, de la mas reciente a la mas
+        antigua -- para poder recorrer sus credenciales desde el visor sin
+        volver al listado. Sin lienzos, por lo mismo que `auditoria`.
+        """
+        num_empleado = (request.query_params.get('num_empleado') or '').strip()
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registros = (
+            EnrolamientoCredencial.objects
+            .filter(num_empleado=num_empleado)
+            .defer('canvas_frente', 'canvas_reverso')
+            .order_by('-fecha_registro')
+        )
+
+        return Response({
+            'status': 'success',
+            'resultados': [{
+                'id_enrolamiento': r.id_enrolamiento,
+                'folio': r.folio,
+                'fecha_expedicion': r.fecha_expedicion,
+                'fin_vig': r.fin_vig,
+                'plantilla_credencial': r.plantilla_credencial,
+                'con_ajustes': bool(r.con_ajustes),
+                'fecha_registro': r.fecha_registro,
+            } for r in registros],
+        })
+
+    @action(detail=False, methods=['get'], url_path='ultima-impresion')
+    def ultima_impresion(self, request):
+        """
+        Ultima credencial impresa de un empleado, para reproducirla al volver
+        a seleccionarlo: misma plantilla y, si los hubo, los ajustes de
+        posicion que se le hicieron.
+
+        NO devuelve el folio ni la fecha para reutilizarlos -- cada
+        reimpresion consume folio nuevo y lleva la fecha del dia. El folio
+        anterior queda en el historial, que es justo lo que da la trazabilidad
+        de que esa persona tuvo antes otra credencial.
+        """
+        num_empleado = (request.query_params.get('num_empleado') or '').strip()
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registro = (
+            EnrolamientoCredencial.objects
+            .filter(num_empleado=num_empleado)
+            .order_by('-fecha_registro')
+            .first()
+        )
+
+        if not registro:
+            return Response({'status': 'success', 'encontrado': False})
+
+        return Response({
+            'status': 'success',
+            'encontrado': True,
+            'id_enrolamiento': registro.id_enrolamiento,
+            'plantilla_credencial': registro.plantilla_credencial,
+            'folio_anterior': registro.folio,
+            'fecha_expedicion': registro.fecha_expedicion,
+            'fecha_registro': registro.fecha_registro,
+            'tiene_ajustes': bool(registro.canvas_frente or registro.canvas_reverso),
+            'canvas_frente': registro.canvas_frente,
+            'canvas_reverso': registro.canvas_reverso,
+            'total_impresiones': EnrolamientoCredencial.objects.filter(
+                num_empleado=num_empleado
+            ).count(),
+        })
 
     @action(detail=False, methods=['get'], url_path='medios')
     def medios(self, request):
@@ -2509,6 +2778,30 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
     # 5 minutos de vigencia no puede devolver datos significativamente viejos.
     _CACHE_INDICE_ROSTER: dict = {}
     _CACHE_INDICE_TTL_SEGUNDOS = 300
+    # Mismo motivo y misma vigencia, pero indexado por num_empleado: lo usa el
+    # inventario de fotos/firmas ya nombradas por numero.
+    _CACHE_EMPLEADOS: dict = {}
+
+    def _indice_empleados(self):
+        """Mapa num_empleado -> datos del roster, cacheado 5 minutos."""
+        ahora = time.monotonic()
+        cacheado = EnrolamientoCredencialViewSet._CACHE_EMPLEADOS
+        if (
+            cacheado.get('indice') is not None
+            and (ahora - cacheado.get('marca', 0)) < self._CACHE_INDICE_TTL_SEGUNDOS
+        ):
+            return cacheado['indice']
+
+        indice = {}
+        for fila in SicreTblSig.objects.values(
+            'no_empleado', 'nombres', 'primer_apellido', 'segundo_apellido', 'curp', 'area'
+        ):
+            numero = (fila['no_empleado'] or '').strip()
+            if numero:
+                indice.setdefault(numero, fila)
+
+        EnrolamientoCredencialViewSet._CACHE_EMPLEADOS = {'indice': indice, 'marca': ahora}
+        return indice
 
     def _indice_roster_por_prefijo(self, refrescar=False):
         """Mapa prefijo de identidad (10 caracteres) -> empleado del roster SIG."""
@@ -2746,6 +3039,131 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
 
         return Response({'status': 'success', 'registros': registros})
 
+    @action(detail=False, methods=['get'], url_path='medios-empleado')
+    def medios_empleado(self, request):
+        """
+        Fotos y firmas ya nombradas por num_empleado, cruzadas con el roster
+        para poder buscarlas por nombre.
+
+        Va paginado y con busqueda EN SERVIDOR, a diferencia del inventario de
+        pendientes: son ~13 300 archivos, y mandarlos todos obligaria al
+        navegador a montar 13 300 <img> de golpe.
+
+        La busqueda cubre num_empleado, nombre, CURP y tambien RFC: aunque el
+        roster no guarda RFC, sus 10 primeros caracteres coinciden con los del
+        CURP, asi que un RFC tecleado se resuelve por ese prefijo.
+        """
+        termino = (request.query_params.get('busqueda') or '').strip()
+        # Fecha de captura (YYYY-MM-DD). Se compara contra el mtime del
+        # archivo, que es cuando se escribio en disco.
+        fecha = (request.query_params.get('fecha') or '').strip()
+        try:
+            pagina = max(1, int(request.query_params.get('pagina', 1)))
+            tam = min(200, max(1, int(request.query_params.get('tam_pagina', 60))))
+        except ValueError:
+            return Response(
+                {'status': 'error', 'mensaje': 'pagina y tam_pagina deben ser numeros.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        archivos = media_utils.listar_medios_por_identificador(solo_numericos=True)
+
+        empleados = self._indice_empleados()
+
+        registros = []
+        for numero, medios in archivos.items():
+            empleado = empleados.get(numero)
+            nombre = ''
+            if empleado:
+                nombre = ' '.join(filter(None, [
+                    empleado.get('nombres'),
+                    empleado.get('primer_apellido'),
+                    empleado.get('segundo_apellido'),
+                ])).strip()
+
+            registros.append({
+                'num_empleado': numero,
+                'nombre': nombre,
+                'curp': (empleado or {}).get('curp') or '',
+                'area': (empleado or {}).get('area') or '',
+                # False = el archivo existe pero esa persona ya no esta en el
+                # roster (baja antigua o nombre invalido). Se muestra igual:
+                # el punto de esta pantalla es tener control del disco.
+                'en_roster': empleado is not None,
+                'foto': medios['foto'],
+                'firma': medios['firma'],
+                'fecha': medios['fecha'],
+            })
+
+        if fecha:
+            try:
+                dia = datetime.strptime(fecha, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'status': 'error', 'mensaje': 'fecha debe venir como YYYY-MM-DD.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # El mtime es epoch en hora del servidor; se compara la fecha local
+            # para que "6 de agosto" signifique el dia natural del operador y
+            # no un tramo corrido en UTC.
+            registros = [
+                r for r in registros
+                if r['fecha'] and datetime.fromtimestamp(r['fecha']).date() == dia
+            ]
+
+        if termino:
+            busca = termino.upper()
+            prefijo = media_utils.prefijo_identidad(termino)
+            def coincide(r):
+                if busca in r['num_empleado'].upper(): return True
+                if busca in r['nombre'].upper(): return True
+                if busca in r['curp'].upper(): return True
+                # RFC tecleado -> se compara contra el prefijo del CURP.
+                return bool(prefijo) and r['curp'].upper().startswith(prefijo)
+            registros = [r for r in registros if coincide(r)]
+
+        registros.sort(key=lambda r: (r['nombre'] or '\uffff', r['num_empleado']))
+
+        total = len(registros)
+        inicio = (pagina - 1) * tam
+        return Response({
+            'status': 'success',
+            'total': total,
+            'pagina': pagina,
+            'tam_pagina': tam,
+            'total_paginas': max(1, (total + tam - 1) // tam),
+            'registros': registros[inicio:inicio + tam],
+        })
+
+    @action(detail=False, methods=['post'], url_path='renombrar-medios')
+    def renombrar_medios(self, request):
+        """
+        Cambia el nombre con el que estan guardadas una foto y una firma.
+
+        Caso tipico: el enrolador tecleo mal el RFC y por eso la credencial no
+        cruza con sus archivos. Aqui se corrige el nombre y el cruce funciona
+        de inmediato, sin volver a tomar la foto.
+        """
+        actual = (request.data.get('identificador_actual') or '').strip()
+        nuevo = (request.data.get('identificador_nuevo') or '').strip()
+
+        try:
+            renombrados = media_utils.renombrar_medios(actual, nuevo)
+        except media_utils.MediaError as exc:
+            return Response(
+                {'status': 'error', 'mensaje': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'status': 'success',
+            'identificador_actual': actual,
+            'identificador_nuevo': nuevo,
+            'renombrados': renombrados,
+            'foto': media_utils.url_publica(media_utils.resolver_foto(nuevo)),
+            'firma': media_utils.url_publica(media_utils.resolver_firma(nuevo)),
+        })
+
     @action(detail=False, methods=['post'], url_path='borrar-medios-previo')
     def borrar_medios_previo(self, request):
         """
@@ -2801,18 +3219,9 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
             'firma': media_utils.url_publica(media_utils.resolver_firma(num_empleado)),
         })
 
-    @action(detail=True, methods=['post'], url_path='marcar-impreso')
-    def marcar_impreso(self, request, pk=None):
-        registro = self.get_object()
-        registro.impreso = 1
-        if not registro.fecha_expedicion:
-            registro.fecha_expedicion = request.data.get('fecha_expedicion') or timezone.now().date()
-        registro.fecha_modificacion = timezone.now()
-        registro.save(update_fields=['impreso', 'fecha_expedicion', 'fecha_modificacion'])
-
-        return Response({'status': 'success', 'id_enrolamiento': registro.id_enrolamiento})
-
-
+    # El action 'marcar-impreso' se elimino junto con la columna `impreso`:
+    # ahora cada fila de la tabla ES una impresion, asi que no hay nada que
+    # marcar. Ver registrar-impresion.
 class PlantillaCredencialViewSet(viewsets.ModelViewSet):
     """CRUD de plantillas disenadas en el editor tipo canvas (Fabric.js)."""
     queryset = PlantillaCredencial.objects.all()
@@ -2962,3 +3371,89 @@ class PlantillaCredencialViewSet(viewsets.ModelViewSet):
             {'status': 'success', 'plantilla': PlantillaCredencialSerializer(copia).data},
             status=status.HTTP_201_CREATED,
         )
+
+
+class UnidadAdministrativaViewSet(viewsets.ModelViewSet):
+    """
+    CRUD del catalogo de unidades administrativas.
+
+    `nombre_compactado` es el texto EXACTO que se imprime en el campo de
+    adscripcion de la credencial. Hoy las aduanas traen 'ANAM' y las
+    Direcciones Generales su acronimo, pero eso es solo el valor con el que se
+    sembro el catalogo: si se edita aqui, la credencial cambia de inmediato
+    sin tocar codigo -- por ejemplo si mas adelante quieren que una aduana
+    imprima su propio nombre.
+    """
+    queryset = UnidadAdministrativa.objects.all()
+    serializer_class = UnidadAdministrativaSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['nombre', 'nombre_compactado']
+    ordering_fields = ['nombre', 'nombre_compactado', 'activo']
+    ordering = ['nombre']
+    pagination_class = None   # son ~66 filas: paginar solo estorba
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        activo = self.request.query_params.get('activo')
+        if activo in ('0', '1'):
+            queryset = queryset.filter(activo=(activo == '1'))
+        return queryset
+
+    def list(self, request, *args, **kwargs):
+        """
+        Lista el catalogo y adjunta a cada unidad cuantos empleados del roster
+        le corresponden. Se resuelve con UNA consulta agregada y un cruce en
+        memoria: hacerlo por fila serian 66 consultas contra una BD remota.
+        """
+        unidades = list(self.filter_queryset(self.get_queryset()))
+
+        conteo = {}
+        filas = (
+            SicreTblSig.objects
+            .exclude(area__isnull=True).exclude(area='')
+            .values_list('area', flat=True)
+        )
+        for area in filas:
+            clave = UnidadAdministrativa.normalizar(area)
+            conteo[clave] = conteo.get(clave, 0) + 1
+
+        for unidad in unidades:
+            unidad.total_empleados = conteo.get(unidad.nombre_normalizado, 0)
+
+        serializer = self.get_serializer(unidades, many=True)
+        return Response({
+            'status': 'success',
+            'total': len(unidades),
+            'registros': serializer.data,
+        })
+
+    @action(detail=False, methods=['get'], url_path='areas-sin-catalogo')
+    def areas_sin_catalogo(self, request):
+        """
+        Areas presentes en el roster que NO tienen entrada en el catalogo.
+
+        Es la alerta que avisa que una unidad nueva llego con el sync y su
+        credencial saldria con el nombre largo: sin esto, el hueco solo se
+        descubriria al imprimir.
+        """
+        catalogo = set(
+            UnidadAdministrativa.objects.values_list('nombre_normalizado', flat=True)
+        )
+
+        faltantes = {}
+        filas = (
+            SicreTblSig.objects
+            .exclude(area__isnull=True).exclude(area='')
+            .values_list('area', flat=True)
+        )
+        for area in filas:
+            clave = UnidadAdministrativa.normalizar(area)
+            if clave not in catalogo:
+                registro = faltantes.setdefault(clave, {'area': area.strip(), 'empleados': 0})
+                registro['empleados'] += 1
+
+        return Response({
+            'status': 'success',
+            'total': len(faltantes),
+            'registros': sorted(faltantes.values(), key=lambda r: -r['empleados']),
+        })

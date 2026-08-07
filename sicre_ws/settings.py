@@ -105,6 +105,18 @@ DATABASES = {
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
+        # El MySQL es REMOTO: abrir la conexion cuesta ~1.9 s (medido), contra
+        # ~0.3 s que tarda una consulta ya conectado. Con el valor por omision
+        # (0) Django cierra la conexion al terminar cada request y la siguiente
+        # vuelve a pagar ese costo, asi que hasta un SELECT de una tabla de 2
+        # filas tardaba cerca de 2 s. Reutilizarla durante 60 s elimina ese
+        # costo en todos los endpoints.
+        #
+        # 60 s esta muy por debajo del wait_timeout del servidor (28800 s), y
+        # CONN_HEALTH_CHECKS hace que Django valide la conexion al reusarla:
+        # si el servidor la cerro por su cuenta, reconecta en vez de fallar.
+        'CONN_MAX_AGE': 60,
+        'CONN_HEALTH_CHECKS': True,
     }
 }
 
