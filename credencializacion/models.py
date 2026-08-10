@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 import re
 import unicodedata
@@ -70,6 +71,20 @@ class EnrolamientoCredencial(models.Model):
     # credencial impresa limpia dejaria de seguir a su plantilla y los
     # cambios de diseño nunca llegarian a las reimpresiones.
     con_ajustes = models.BooleanField(default=False)
+
+    # Rutas del archivo historico de la foto, la firma y los fondos que
+    # llevaba ESTA credencial: {'foto': 'historico/aa/<hash>.jpg', ...}.
+    #
+    # Es un indice, no una segunda copia: los mismos valores estan dentro del
+    # lienzo. Existe porque dentro del snapshot no hay forma de saber cual
+    # imagen es la foto y cual la firma -- al poblar la plantilla, el marcador
+    # se sustituye por un FabricImage que no conserva el `data.campo` del
+    # original. El rol si se sabe en el momento de archivar, mirando la
+    # carpeta de origen (`fotos/` contra `FIRMAS/`), asi que se anota ahi.
+    #
+    # Sin esto, la auditoria de medios tendria que descargar y recorrer los
+    # ~47 KB de lienzo de cada impresion solo para saber que foto se uso.
+    medios = models.JSONField(blank=True, null=True)
 
     # Auditoria
     fecha_registro = models.DateTimeField(auto_now_add=True, blank=True, null=True)
@@ -454,3 +469,109 @@ class UnidadAdministrativa(models.Model):
     def save(self, *args, **kwargs):
         self.nombre_normalizado = self.normalizar(self.nombre)
         super().save(*args, **kwargs)
+
+
+# Catalogo de permisos del sistema: (codename, descripcion). Fuente unica de
+# verdad -- `RecursoSistema.Meta.permissions` lo usa para poblar
+# `auth_permission`, y `views.py` lo reimporta para filtrar el arreglo
+# `permisos` que viaja en la respuesta de login (asi un superusuario no
+# recibe tambien los ~40 permisos add/change/delete/view que Django crea
+# automaticamente para cada modelo de la app, que no significan nada aqui).
+#
+# Los codenames `ver_*` controlan si el MENU y la RUTA de esa pantalla son
+# visibles/accesibles (gating de frontend, ver AuthGuard + sidebar). Los
+# demas controlan una funcionalidad puntual DENTRO de una pantalla ya
+# visible -- por ejemplo, ver "Imprimir credenciales" no implica poder usar
+# el modo edicion rapida.
+#
+# NOTA para quien edite este catalogo: la migracion de datos 0025 tiene su
+# PROPIA copia congelada de esta lista (asi debe ser -- una migracion no debe
+# depender de que el codigo actual siga vigente). Agregar un codename aqui no
+# lo agrega retroactivamente al rol de respaldo "Acceso heredado"; eso
+# requeriria una migracion nueva si se quiere que los usuarios existentes lo
+# hereden tambien.
+CODENAMES_CATALOGO_PERMISOS = [
+    # ---- Acceso a pantalla (gating de menu/ruta) ----
+    ('ver_enrolamiento', 'Ver: Enrolamiento'),
+    ('ver_registro_empleado', 'Ver: Registro rápido de empleado'),
+    ('ver_plantilla_anam', 'Ver: Carga manual ANAM'),
+    ('ver_provisional', 'Ver: Carga manual Nuevo Laredo'),
+    ('ver_familiar', 'Ver: Familiares Nuevo Laredo'),
+    ('ver_busqueda_avanzada', 'Ver: Búsqueda avanzada'),
+    ('ver_busqueda_enrolamiento_masivos', 'Ver: Búsqueda de enrolamiento masivo'),
+    ('ver_enrolamiento_masivo', 'Ver: Enrolamiento masivo'),
+    ('ver_carga_masiva', 'Ver: Carga masiva de Excel'),
+    ('ver_credencializacion', 'Ver: Credencialización (legado)'),
+    ('ver_reportes', 'Ver: Reportes'),
+    ('ver_plantillas', 'Ver: Editor de plantillas'),
+    ('ver_imprimir_credenciales', 'Ver: Imprimir credenciales'),
+    ('ver_enrolamiento_previo', 'Ver: Enrolamiento previo'),
+    ('ver_inventario_medios', 'Ver: Inventario de medios'),
+    ('ver_catalogo_areas', 'Ver: Catálogo de áreas'),
+    ('ver_auditoria_credenciales', 'Ver: Auditoría de credenciales'),
+
+    # ---- Funcionalidades dentro de una pantalla ----
+    ('plantillas_administrar', 'Plantillas: crear, editar, eliminar y marcar por defecto'),
+    ('medios_administrar', 'Inventario de medios: reemplazar, renombrar y eliminar'),
+    ('medios_respaldo', 'Administración: descargar respaldo (zip) de fotos y firmas'),
+    ('areas_administrar', 'Catálogo de áreas: crear, editar y eliminar'),
+    ('credenciales_editar_ajustes', 'Imprimir credenciales: usar el modo edición rápida'),
+]
+
+
+class RecursoSistema(models.Model):
+    """
+    Modelo ancla del catalogo de permisos -- Django exige que todo permiso
+    cuelgue de un `content_type`, y esta app no tenia ninguno neutral para
+    colgar permisos que no son "CRUD de una tabla" sino "acceso a una
+    pantalla" o "puede hacer X dentro de una pantalla".
+
+    No es una tabla de datos real: nadie crea filas aqui. Su unico proposito
+    es darle un content_type a `Meta.permissions`, que es lo que puebla
+    `auth_permission` (Django lo hace solo, via el signal `post_migrate`,
+    cada vez que corre `migrate`).
+
+    Los roles (`auth_group`) se arman escogiendo permisos de este catalogo,
+    y los usuarios (`auth_user`) se arman escogiendo roles -- ambos con el
+    sistema nativo de Django, sin tablas propias. Ver `credencializacion/auth.py`
+    y las vistas `UsuarioViewSet`/`RolViewSet`/`PermisoViewSet`.
+    """
+    nombre = models.CharField(max_length=100, unique=True)
+
+    class Meta:
+        managed = True
+        db_table = 'sicre_cat_recurso_sistema'
+        verbose_name = 'Recurso del sistema'
+        verbose_name_plural = 'Recursos del sistema (catálogo de permisos)'
+        permissions = CODENAMES_CATALOGO_PERMISOS
+
+    def __str__(self):
+        return self.nombre
+
+
+class PerfilUsuario(models.Model):
+    """
+    Datos de `auth_user` que Django no trae de fabrica -- ahora mismo solo
+    `num_empleado`, para poder mostrar la foto de la persona (ya archivada en
+    MEDIA_ROOT/fotos por num_empleado) junto a su nombre en el header.
+
+    OneToOne en vez de agregar columnas a `auth_user` o cambiar
+    AUTH_USER_MODEL: es el patron estandar de Django para extender el
+    usuario sin tocar la tabla nativa, y evita una migracion de datos de
+    todo el sistema de autenticacion solo por un campo.
+    """
+    usuario = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='perfil',
+    )
+    # Vacio es valido: no toda cuenta corresponde a una persona con num_empleado
+    # (o todavia no se lo han asignado). No es un FK a SicreTblSig -- ese
+    # modelo no tiene FKs a nada, se cruza siempre por valor (ver CLAUDE.md).
+    num_empleado = models.CharField(max_length=20, blank=True, default='')
+
+    class Meta:
+        db_table = 'sicre_tbl_perfil_usuario'
+        verbose_name = 'Perfil de usuario'
+        verbose_name_plural = 'Perfiles de usuario'
+
+    def __str__(self):
+        return f'{self.usuario.username} ({self.num_empleado or "sin num_empleado"})'

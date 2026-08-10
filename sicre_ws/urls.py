@@ -23,6 +23,7 @@ from credencializacion.views import (
     EnrolamientoViewSet, SigViewSet, CustomLoginView, EnrolamientoFamiliarViewSet,
     foto_firma_empleado, CargaMasivaViewSet, EnrolamientoCredencialViewSet,
     PlantillaCredencialViewSet, UnidadAdministrativaViewSet,
+    UsuarioViewSet, RolViewSet, PermisoViewSet,
 )
 
 
@@ -36,6 +37,11 @@ router.register(r'carga-masiva', CargaMasivaViewSet, basename='carga-masiva')
 router.register(r'enrolamiento-credencial', EnrolamientoCredencialViewSet, basename='enrolamiento-credencial')
 router.register(r'plantillas-credencial', PlantillaCredencialViewSet, basename='plantillas-credencial')
 router.register(r'unidades-administrativas', UnidadAdministrativaViewSet, basename='unidades-administrativas')
+# Administracion: usuarios, roles y catalogo de permisos (auth_user / auth_group
+# / auth_permission -- gateados a superusuario, ver auth.EsSuperusuario).
+router.register(r'usuarios', UsuarioViewSet, basename='usuarios')
+router.register(r'roles', RolViewSet, basename='roles')
+router.register(r'permisos', PermisoViewSet, basename='permisos')
 
 urlpatterns = [
     path('admin/', admin.site.urls),

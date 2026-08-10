@@ -6,18 +6,22 @@ from rest_framework.pagination import PageNumberPagination
 from .models import (
     Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
     EnrolamientoCredencial, PlantillaCredencial, ConsecutivoFolio,
-    UnidadAdministrativa,
+    UnidadAdministrativa, CODENAMES_CATALOGO_PERMISOS,
 )
 from .serializers import (
     EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer,
     ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer,
     CargaMasivaSerializer, EnrolamientoCredencialSerializer, PlantillaCredencialSerializer,
-    UnidadAdministrativaSerializer,
+    UnidadAdministrativaSerializer, UsuarioSerializer, RolSerializer, PermisoSerializer,
 )
+from .auth import EsSuperusuario, tiene_permiso
 from . import media_utils
 from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group, Permission
 from django.db.models import Q, Count, Min
 from django.db import models, transaction, connection
+from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
@@ -31,6 +35,54 @@ from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from io import BytesIO
 from django.utils import timezone
+import tempfile
+import zipfile
+from django.http import FileResponse
+
+
+def _usuario_actual_id(request):
+    """
+    Id del usuario autenticado, para las columnas de auditoria
+    (`id_usuario_registra` / `id_usuario_modifica`).
+
+    Se toma de `request.user`, que es lo unico en lo que se puede confiar: un
+    `id_usuario` mandado en el cuerpo lo elige el cliente y cualquiera podria
+    atribuirle una impresion a otra persona -- justo lo que una auditoria no
+    puede permitir.
+
+    Regresa None si nadie inicio sesion, para que la columna quede vacia en
+    vez de con un id inventado.
+    """
+    usuario = getattr(request, 'user', None)
+    if usuario is not None and getattr(usuario, 'is_authenticated', False):
+        return usuario.id
+    return None
+
+
+class AuditoriaUsuarioMixin:
+    """
+    Sella automaticamente quien creo/modifico la fila, en los modelos que
+    tienen las columnas `id_usuario_registra` / `id_usuario_modifica`
+    (EnrolamientoCredencial, PlantillaCredencial, Enrolamiento,
+    EnrolamientoFamiliar, CargaMasiva).
+
+    El check `hasattr` hace que este mixin sea seguro de poner en CUALQUIER
+    ModelViewSet: en los modelos que no tienen esas columnas simplemente no
+    hace nada.
+    """
+    def perform_create(self, serializer):
+        campos = {f.name for f in self.get_queryset().model._meta.get_fields()}
+        extra = {}
+        if 'id_usuario_registra' in campos:
+            extra['id_usuario_registra'] = _usuario_actual_id(self.request)
+        serializer.save(**extra)
+
+    def perform_update(self, serializer):
+        campos = {f.name for f in self.get_queryset().model._meta.get_fields()}
+        extra = {}
+        if 'id_usuario_modifica' in campos:
+            extra['id_usuario_modifica'] = _usuario_actual_id(self.request)
+        serializer.save(**extra)
 
 
 def _cargo_a_nivel(cargo: str) -> str:
@@ -369,7 +421,7 @@ def procesar_foto_desde_excel(valor_celda, fila_numero=None, imagenes_excel=None
         return None
 
 
-class EnrolamientoViewSet(viewsets.ModelViewSet):
+class EnrolamientoViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
     queryset = Enrolamiento.objects.all().order_by('-id_enrolamiento')
     serializer_class = EnrolamientoSerializer
     
@@ -1295,7 +1347,7 @@ class EnrolamientoViewSet(viewsets.ModelViewSet):
 
 
 
-class EnrolamientoFamiliarViewSet(viewsets.ModelViewSet):
+class EnrolamientoFamiliarViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
     queryset = EnrolamientoFamiliar.objects.all().order_by('-id_enrolamiento')
     serializer_class = EnrolamientoFamiliarSerializer
 
@@ -1951,17 +2003,57 @@ class CustomLoginView(APIView):
 
                 token, created = Token.objects.get_or_create(user=user)
 
+                num_empleado = getattr(getattr(user, 'perfil', None), 'num_empleado', '') or ''
+                foto = None
+                if num_empleado:
+                    ruta_foto = media_utils.resolver_foto(num_empleado)
+                    foto = media_utils.url_publica(ruta_foto) if ruta_foto else None
+
                 return Response({
                     'status': 200,
                     'message': 'Login exitoso',
                     'model': {
                         'token': token.key,
+                        # `tokenWs` es el nombre que en realidad lee
+                        # TokenInterceptor -- se manda tambien asi para no
+                        # tener que tocar el interceptor (corre en cada
+                        # peticion del sistema). Antes de este cambio ningun
+                        # login real mandaba Authorization en absoluto: no
+                        # importaba porque el backend no autenticaba a nadie
+                        # (ver CLAUDE.md, gotcha #3), pero ahora que las
+                        # pantallas de administracion SI exigen sesion, hacia
+                        # falta que coincidiera.
+                        'tokenWs': token.key,
                         'idUsuario': user.id,
+                        'username': user.username,
                         'nombreCompleto': f"{user.first_name} {user.last_name}",
                         'email': user.email,
-                        'unidadAdscripcion': getattr(user, 'adscripcion', ''), 
+                        'unidadAdscripcion': getattr(user, 'adscripcion', ''),
                         'area': 'SICRE',
+                        'numEmpleado': num_empleado,
+                        'foto': foto,
+                        # Se conserva por compatibilidad -- nada del sistema
+                        # nuevo de permisos lo usa ya (ver `permisos` /
+                        # `esSuperusuario`), pero quitarlo de golpe podria
+                        # romper algo que todavia lo lea.
                         'idUsuarioRol': 9999 if user.is_superuser else (2 if user.is_staff else 4),
+                        'esSuperusuario': user.is_superuser,
+                        # Codenames sin el prefijo de la app ('ver_plantillas',
+                        # no 'credencializacion.ver_plantillas'): son unicos
+                        # dentro del catalogo y asi el frontend no tiene que
+                        # conocer el nombre de la app Django.
+                        #
+                        # Se filtra contra CODENAMES_CATALOGO_PERMISOS, no solo
+                        # contra el prefijo de la app: sin esto, un superusuario
+                        # (que Django considera dueno de TODOS los permisos)
+                        # recibiria tambien los add/change/delete/view que se
+                        # crean automaticamente para cada modelo -- ruido que
+                        # no significa nada para este sistema de menus.
+                        'permisos': sorted({
+                            p.split('.', 1)[1] for p in user.get_all_permissions()
+                            if p.startswith('credencializacion.')
+                            and p.split('.', 1)[1] in dict(CODENAMES_CATALOGO_PERMISOS)
+                        }),
                     }
                 }, status=status.HTTP_200_OK)
             else:
@@ -2027,7 +2119,7 @@ class CargaMasivaPagination(PageNumberPagination):
     max_page_size = 500
 
 
-class CargaMasivaViewSet(viewsets.ModelViewSet):
+class CargaMasivaViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
     serializer_class = CargaMasivaSerializer
     pagination_class = CargaMasivaPagination
     filter_backends = [filters.SearchFilter]
@@ -2258,18 +2350,147 @@ class EnrolamientoCredencialPagination(PageNumberPagination):
     max_page_size = 500
 
 
-class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
+def _congelar_snapshot(canvas_json, medios=None):
+    """
+    Deja un lienzo de Fabric listo para archivarse como constancia de lo
+    impreso: cada imagen que apunta a MEDIA_ROOT se copia al archivo historico
+    y su `src` se reescribe a esa copia inmutable.
+
+    Sin esto el snapshot seria solo *aparentemente* fiel. Las imagenes viajan
+    como URL (`http://host/media/fotos/123.png?v=1786056998`), no como bytes,
+    de modo que apuntan al archivo VIVO: si manana recapturan la foto de esa
+    persona, la credencial impresa hace seis meses empezaria a mostrar la cara
+    nueva sobre el folio viejo. Peor todavia, el `?v=<mtime>` cambia al
+    reemplazarla y la imagen dejaria de cargar del todo.
+
+    Se recorren tambien los grupos anidados y el `backgroundImage` -- el fondo
+    de la plantilla vive ahi, y las plantillas son editables, asi que tampoco
+    se puede confiar en que siga siendo el mismo.
+
+    Los data-URI (el QR, que se genera en el navegador) se dejan intactos: ya
+    son bytes, no referencias.
+
+    Si se pasa un diccionario en `medios`, se anota ahi que archivo quedo como
+    foto, firma y fondo. El rol solo se puede saber AQUI, por la carpeta de
+    origen: una vez archivado, el nombre es un hash y ya no dice nada.
+    """
+    if not isinstance(canvas_json, dict):
+        return None
+
+    carpetas = {
+        media_utils.carpeta_fotos(): 'foto',
+        media_utils.carpeta_firmas(): 'firma',
+        media_utils.carpeta_plantillas(): 'fondo',
+    }
+
+    def archivar_nodo(nodo):
+        if not isinstance(nodo, dict):
+            return
+
+        src = nodo.get('src')
+        if isinstance(src, str) and src:
+            relativa = media_utils.ruta_relativa_desde_url(src)
+            archivada = media_utils.archivar_medio(relativa) if relativa else None
+            if archivada:
+                # Sin `?v=`: la ruta ya identifica el contenido por su hash,
+                # asi que nunca cambia y puede cachearse para siempre.
+                nodo['src'] = media_utils.url_publica(archivada, versionada=False)
+
+                if medios is not None:
+                    rol = carpetas.get(str(relativa).split('/', 1)[0])
+                    # `setdefault`: si la misma cara trae dos imagenes de la
+                    # misma carpeta, se conserva la primera en vez de que la
+                    # ultima pise a la anterior.
+                    if rol:
+                        medios.setdefault(rol, archivada)
+
+        for hijo in (nodo.get('objects') or []):
+            archivar_nodo(hijo)
+
+    archivar_nodo(canvas_json.get('backgroundImage'))
+    for objeto in (canvas_json.get('objects') or []):
+        archivar_nodo(objeto)
+
+    return canvas_json
+
+
+class EnrolamientoCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
     """
     Registro de qué pasó al expedir cada credencial (folio, vigencias,
     plantilla usada, estatus de impresión) -- NO los datos del empleado, que
     viven en sicre_tbl_sig y se consultan cruzando por num_empleado. Ver
     docstring del modelo EnrolamientoCredencial.
     """
-    queryset = EnrolamientoCredencial.objects.all().order_by('-id_enrolamiento')
+    # `defer` sobre los lienzos NO es una optimizacion opcional: cada fila
+    # lleva ~47 KB de JSON y MySQL mete la fila COMPLETA en el buffer de
+    # ordenamiento. Sin esto, cualquier listado ordenado revienta con
+    # "Out of sort memory, consider increasing server sort buffer size" en
+    # cuanto la tabla crece -- reproducido con apenas unas decenas de filas.
+    # Quien necesite el lienzo lo pide por `auditoria-detalle`.
+    queryset = (
+        EnrolamientoCredencial.objects
+        .defer('canvas_frente', 'canvas_reverso')
+        .order_by('-id_enrolamiento')
+    )
     serializer_class = EnrolamientoCredencialSerializer
     filter_backends = [filters.SearchFilter]
     search_fields = ['num_empleado', 'folio']
     pagination_class = EnrolamientoCredencialPagination
+
+    # Acciones EXCLUSIVAS de "Inventario de medios" (renombrar un RFC mal
+    # tecleado, cruzarlo al num_empleado definitivo, borrar un pendiente):
+    # exigen `medios_administrar`. Deliberadamente NO se incluye aqui
+    # `guardar-medios-empleado`: la usan tambien "Imprimir credenciales" y la
+    # captura normal de "Enrolamiento previo" para su propio flujo del dia a
+    # dia (tomar/reemplazar una foto antes de imprimir), que no es una
+    # operacion "administrativa" y no deberia depender de ese permiso.
+    _ACCIONES_MEDIOS_ADMINISTRAR = {
+        'migrar_medios', 'migrar_medios_lote', 'renombrar_medios', 'borrar_medios_previo',
+    }
+    # Descarga masiva de /media -- permiso propio y distinto de
+    # `medios_administrar`: bajar un respaldo completo no es lo mismo que
+    # poder renombrar/borrar capturas individuales, y se quiere poder
+    # asignar por separado desde /administracion.
+    _ACCIONES_MEDIOS_RESPALDO = {'respaldo_fotos', 'respaldo_firmas'}
+
+    def get_permissions(self):
+        if self.action in self._ACCIONES_MEDIOS_ADMINISTRAR:
+            return [IsAuthenticated(), tiene_permiso('medios_administrar')()]
+        if self.action in self._ACCIONES_MEDIOS_RESPALDO:
+            return [IsAuthenticated(), tiene_permiso('medios_respaldo')()]
+        return super().get_permissions()
+
+    def _respaldo_carpeta(self, subcarpeta, etiqueta):
+        """
+        Zippea MEDIA_ROOT/<subcarpeta> completa y la manda como descarga.
+
+        Se arma en un archivo temporal SIN NOMBRE (tempfile.TemporaryFile):
+        con ~14 mil fotos el zip pesa cientos de MB, y guardarlo en memoria
+        (BytesIO) reventaria el proceso. El archivo se borra solo del disco
+        en cuanto FileResponse termina de mandarlo y lo cierra.
+        """
+        carpeta = Path(settings.MEDIA_ROOT) / subcarpeta
+        tmp = tempfile.TemporaryFile(suffix='.zip')
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zf:
+            if carpeta.is_dir():
+                for archivo in sorted(carpeta.iterdir()):
+                    if archivo.is_file():
+                        zf.write(archivo, arcname=archivo.name)
+        tamano = tmp.tell()
+        tmp.seek(0)
+
+        nombre = f'{etiqueta}_{timezone.now():%Y%m%d_%H%M}.zip'
+        respuesta = FileResponse(tmp, as_attachment=True, filename=nombre)
+        respuesta['Content-Length'] = tamano
+        return respuesta
+
+    @action(detail=False, methods=['get'], url_path='respaldo-fotos')
+    def respaldo_fotos(self, request):
+        return self._respaldo_carpeta(settings.MEDIA_DIR_FOTOS, 'fotos')
+
+    @action(detail=False, methods=['get'], url_path='respaldo-firmas')
+    def respaldo_firmas(self, request):
+        return self._respaldo_carpeta(settings.MEDIA_DIR_FIRMAS, 'firmas')
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2395,19 +2616,25 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Snapshot de AMBAS caras, siempre. Sus imagenes quedan archivadas en
+        # media/historico/ para que nadie las pueda reemplazar despues, y de
+        # paso se anota cual quedo como foto, firma y fondo.
+        medios = {}
+        canvas_frente = _congelar_snapshot(request.data.get('canvas_frente'), medios)
+        canvas_reverso = _congelar_snapshot(request.data.get('canvas_reverso'), medios)
+
         registro = EnrolamientoCredencial.objects.create(
             num_empleado=num_empleado,
             folio=(request.data.get('folio') or None),
             fecha_expedicion=request.data.get('fecha_expedicion') or timezone.now().date(),
             fin_vig=request.data.get('fin_vig') or None,
             plantilla_credencial=(request.data.get('plantilla_credencial') or None),
-            # Snapshot de AMBAS caras, siempre. Sus imagenes quedan archivadas
-            # en media/historico/ para que nadie las pueda reemplazar despues.
-            canvas_frente=_congelar_snapshot(request.data.get('canvas_frente')),
-            canvas_reverso=_congelar_snapshot(request.data.get('canvas_reverso')),
+            canvas_frente=canvas_frente,
+            canvas_reverso=canvas_reverso,
+            medios=(medios or None),
             con_ajustes=bool(request.data.get('con_ajustes')),
             activo=1,
-            id_usuario_registra=request.data.get('id_usuario'),
+            id_usuario_registra=_usuario_actual_id(request),
         )
 
         return Response(
@@ -2531,6 +2758,148 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
             'canvas_reverso': registro.canvas_reverso,
         })
 
+    @action(detail=False, methods=['get'], url_path='auditoria-medios')
+    def auditoria_medios(self, request):
+        """
+        Empleados con MAS DE UNA impresion, para la pestaña "Auditoría" del
+        inventario de medios: muestra la foto y la firma vigentes y, detras,
+        todas las versiones que se llegaron a imprimir.
+
+        Solo se listan los reimpresos porque son los unicos donde hay algo que
+        comparar: con una sola impresion, la version archivada y la vigente
+        son la misma.
+
+        La consulta va sobre la columna `medios` (unos cuantos bytes por fila),
+        NO sobre los lienzos: recorrer los ~47 KB de cada impresion solo para
+        saber que foto se uso haria inservible esta pantalla.
+        """
+        registros = (
+            EnrolamientoCredencial.objects
+            .exclude(num_empleado__isnull=True)
+            .exclude(num_empleado='')
+            .values('num_empleado', 'medios', 'folio', 'fecha_registro', 'id_enrolamiento')
+            .order_by('num_empleado', '-fecha_registro')
+        )
+
+        por_empleado = {}
+        for r in registros:
+            por_empleado.setdefault(r['num_empleado'].strip(), []).append(r)
+
+        empleados = self._indice_empleados()
+        busqueda = (request.query_params.get('busqueda') or '').strip().upper()
+
+        filas = []
+        for numero, impresiones in por_empleado.items():
+            if len(impresiones) < 2:
+                continue
+
+            datos = empleados.get(numero) or {}
+            nombre = ' '.join(filter(None, [
+                (datos.get('nombres') or '').strip(),
+                (datos.get('primer_apellido') or '').strip(),
+                (datos.get('segundo_apellido') or '').strip(),
+            ]))
+
+            if busqueda and busqueda not in numero.upper() and busqueda not in nombre.upper():
+                continue
+
+            # Versiones DISTINTAS, en orden de la mas reciente a la mas
+            # antigua. Se cuentan por ruta: como el archivo se nombra por el
+            # hash de su contenido, dos rutas iguales son literalmente la
+            # misma imagen, aunque se hayan impreso en fechas distintas.
+            versiones = {'foto': [], 'firma': []}
+            for imp in impresiones:
+                for rol in ('foto', 'firma'):
+                    ruta = (imp.get('medios') or {}).get(rol)
+                    if ruta and ruta not in versiones[rol]:
+                        versiones[rol].append(ruta)
+
+            filas.append({
+                'num_empleado': numero,
+                'nombre': nombre,
+                'curp': (datos.get('curp') or '').strip(),
+                'total_impresiones': len(impresiones),
+                'ultima_impresion': impresiones[0]['fecha_registro'],
+                # Lo vigente en disco hoy, que es lo que se imprimiria ahora.
+                'foto_actual': media_utils.url_publica(media_utils.resolver_foto(numero)),
+                'firma_actual': media_utils.url_publica(media_utils.resolver_firma(numero)),
+                'versiones_foto': len(versiones['foto']),
+                'versiones_firma': len(versiones['firma']),
+                # Cambio de medios: la version archivada mas reciente no es la
+                # unica que existe. Es la señal que hace interesante la fila.
+                'cambio_medios': len(versiones['foto']) > 1 or len(versiones['firma']) > 1,
+            })
+
+        filas.sort(key=lambda f: (not f['cambio_medios'], -f['total_impresiones']))
+
+        return Response({
+            'status': 'success',
+            'total': len(filas),
+            'resultados': filas,
+        })
+
+    @action(detail=False, methods=['get'], url_path='auditoria-medios-detalle')
+    def auditoria_medios_detalle(self, request):
+        """
+        Foto y firma que llevo CADA impresion de un empleado, de la mas
+        reciente a la mas antigua, junto con lo que hay hoy en disco.
+
+        Las rutas apuntan al archivo historico, asi que siguen mostrando la
+        imagen con la que se expidio esa credencial aunque despues se haya
+        recapturado.
+        """
+        num_empleado = (request.query_params.get('num_empleado') or '').strip()
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registros = (
+            EnrolamientoCredencial.objects
+            .filter(num_empleado=num_empleado)
+            .values('id_enrolamiento', 'folio', 'fecha_registro', 'fecha_expedicion', 'medios')
+            .order_by('-fecha_registro')
+        )
+
+        foto_actual = media_utils.resolver_foto(num_empleado)
+        firma_actual = media_utils.resolver_firma(num_empleado)
+
+        # Para saber si una impresion llevaba la imagen que sigue vigente hay
+        # que comparar CONTENIDO, no rutas: lo archivado vive en
+        # `historico/<hash>.ext` y lo vigente en `fotos/<numero>.ext`, asi que
+        # por ruta jamas coincidirian. El hash del archivo vigente se calcula
+        # una sola vez y se contrasta con el que ya lleva el nombre archivado.
+        vigente = {
+            'foto': media_utils.hash_contenido(foto_actual),
+            'firma': media_utils.hash_contenido(firma_actual),
+        }
+
+        impresiones = []
+        for r in registros:
+            medios = r.get('medios') or {}
+            fila = {
+                'id_enrolamiento': r['id_enrolamiento'],
+                'folio': r['folio'],
+                'fecha_registro': r['fecha_registro'],
+                'fecha_expedicion': r['fecha_expedicion'],
+            }
+            for rol in ('foto', 'firma'):
+                ruta = medios.get(rol)
+                fila[rol] = media_utils.url_publica(ruta, versionada=False)
+                fila[f'{rol}_vigente'] = bool(
+                    ruta and vigente[rol] and media_utils.hash_desde_ruta(ruta) == vigente[rol]
+                )
+            impresiones.append(fila)
+
+        return Response({
+            'status': 'success',
+            'num_empleado': num_empleado,
+            'foto_actual': media_utils.url_publica(foto_actual),
+            'firma_actual': media_utils.url_publica(firma_actual),
+            'impresiones': impresiones,
+        })
+
     @action(detail=False, methods=['get'], url_path='auditoria-empleado')
     def auditoria_empleado(self, request):
         """
@@ -2587,6 +2956,9 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
         registro = (
             EnrolamientoCredencial.objects
             .filter(num_empleado=num_empleado)
+            # Los lienzos quedan diferidos: Django solo los trae de la BD si
+            # abajo se acceden, cosa que pasa unicamente cuando hubo ajustes.
+            .defer('canvas_frente', 'canvas_reverso')
             .order_by('-fecha_registro')
             .first()
         )
@@ -2602,9 +2974,18 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
             'folio_anterior': registro.folio,
             'fecha_expedicion': registro.fecha_expedicion,
             'fecha_registro': registro.fecha_registro,
-            'tiene_ajustes': bool(registro.canvas_frente or registro.canvas_reverso),
-            'canvas_frente': registro.canvas_frente,
-            'canvas_reverso': registro.canvas_reverso,
+            # Desde que el snapshot se guarda SIEMPRE, "hay lienzo" ya no
+            # significa "lo ajustaron a mano": eso lo dice `con_ajustes`. Si se
+            # restaurara el lienzo en toda reimpresion, una credencial impresa
+            # limpia dejaria de seguir a su plantilla y los cambios de diseño
+            # nunca alcanzarian a las reimpresiones.
+            'tiene_ajustes': bool(registro.con_ajustes),
+            # El lienzo solo viaja cuando hay ajustes que restaurar. Mandarlo
+            # siempre sumaria ~47 KB a CADA seleccion de empleado para que el
+            # navegador lo tirara sin usarlo. La auditoria, que si los necesita
+            # todos, los pide por `auditoria-detalle`.
+            'canvas_frente': registro.canvas_frente if registro.con_ajustes else None,
+            'canvas_reverso': registro.canvas_reverso if registro.con_ajustes else None,
             'total_impresiones': EnrolamientoCredencial.objects.filter(
                 num_empleado=num_empleado
             ).count(),
@@ -3222,12 +3603,23 @@ class EnrolamientoCredencialViewSet(viewsets.ModelViewSet):
     # El action 'marcar-impreso' se elimino junto con la columna `impreso`:
     # ahora cada fila de la tabla ES una impresion, asi que no hay nada que
     # marcar. Ver registrar-impresion.
-class PlantillaCredencialViewSet(viewsets.ModelViewSet):
+class PlantillaCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
     """CRUD de plantillas disenadas en el editor tipo canvas (Fabric.js)."""
     queryset = PlantillaCredencial.objects.all()
     serializer_class = PlantillaCredencialSerializer
     filter_backends = [filters.SearchFilter]
     search_fields = ['clave', 'nombre', 'descripcion']
+
+    # Ver y usar plantillas (list/retrieve/por-defecto, que consume "Imprimir
+    # credenciales" en cada seleccion) se queda abierto. Solo DISEÑAR una
+    # plantilla -- crearla, editarla, borrarla o cambiar cual es la que se usa
+    # por omision -- exige `plantillas_administrar`.
+    _ACCIONES_ADMINISTRAR = {'create', 'update', 'partial_update', 'destroy', 'marcar_por_defecto'}
+
+    def get_permissions(self):
+        if self.action in self._ACCIONES_ADMINISTRAR:
+            return [IsAuthenticated(), tiene_permiso('plantillas_administrar')()]
+        return super().get_permissions()
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -3392,6 +3784,16 @@ class UnidadAdministrativaViewSet(viewsets.ModelViewSet):
     ordering = ['nombre']
     pagination_class = None   # son ~66 filas: paginar solo estorba
 
+    # Consultar el catalogo (list/retrieve, incluido `areas-sin-catalogo`) se
+    # queda abierto -- lo necesita cualquiera que imprima credenciales para
+    # ver el nombre compactado. Solo EDITARLO exige `areas_administrar`.
+    _ACCIONES_ADMINISTRAR = {'create', 'update', 'partial_update', 'destroy'}
+
+    def get_permissions(self):
+        if self.action in self._ACCIONES_ADMINISTRAR:
+            return [IsAuthenticated(), tiene_permiso('areas_administrar')()]
+        return super().get_permissions()
+
     def get_queryset(self):
         queryset = super().get_queryset()
         activo = self.request.query_params.get('activo')
@@ -3457,3 +3859,113 @@ class UnidadAdministrativaViewSet(viewsets.ModelViewSet):
             'total': len(faltantes),
             'registros': sorted(faltantes.values(), key=lambda r: -r['empleados']),
         })
+
+
+# ==========================================================================
+# Administracion: usuarios, roles y catalogo de permisos
+# ==========================================================================
+# Gateado a EsSuperusuario en las TRES vistas -- ver docstring de esa clase
+# en auth.py: quien puede crear cuentas o repartir permisos debe ser alguien
+# de maxima confianza, y `is_superuser` (nativo de Django) ya resuelve ese
+# caso sin necesitar una tabla de roles-de-administrador aparte.
+
+Usuario = get_user_model()
+
+
+class UsuarioViewSet(viewsets.ModelViewSet):
+    """
+    CRUD de `auth_user` para la pantalla de administracion.
+
+    No hay borrado fisico (`destroy` no esta expuesto vía DRF salvo que se
+    quiera; se deja fuera a proposito): un usuario desactivado conserva su
+    huella en `id_usuario_registra`/`id_usuario_modifica` de todo lo que
+    hizo. Borrarlo de verdad dejaria esas columnas apuntando a un id
+    inexistente, y la auditoria dejaria de poder decir quien hizo que.
+    """
+    queryset = Usuario.objects.all().order_by('username')
+    serializer_class = UsuarioSerializer
+    permission_classes = [IsAuthenticated, EsSuperusuario]
+    http_method_names = ['get', 'post', 'patch', 'head', 'options']
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related('perfil').prefetch_related('groups')
+        busqueda = (self.request.query_params.get('busqueda') or '').strip()
+        if busqueda:
+            qs = qs.filter(
+                Q(username__icontains=busqueda) | Q(email__icontains=busqueda)
+                | Q(first_name__icontains=busqueda) | Q(last_name__icontains=busqueda)
+            )
+        return qs
+
+    @action(detail=True, methods=['post'], url_path='activar')
+    def activar(self, request, pk=None):
+        usuario = self.get_object()
+        usuario.is_active = True
+        usuario.save(update_fields=['is_active'])
+        return Response({'status': 'success', 'is_active': True})
+
+    @action(detail=True, methods=['post'], url_path='desactivar')
+    def desactivar(self, request, pk=None):
+        """
+        Desactivar, no borrar: `is_active=False` le impide iniciar sesion
+        (Django lo revisa solo en `authenticate()`) sin destruir el historial
+        de lo que esa cuenta hizo.
+        """
+        usuario = self.get_object()
+        if usuario.pk == request.user.pk:
+            return Response(
+                {'status': 'error', 'mensaje': 'No puedes desactivar tu propia cuenta.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        usuario.is_active = False
+        usuario.save(update_fields=['is_active'])
+        return Response({'status': 'success', 'is_active': False})
+
+    @action(detail=True, methods=['post'], url_path='set-password')
+    def set_password(self, request, pk=None):
+        """
+        El superusuario fija una contrasena nueva para la cuenta -- no es un
+        flujo de "olvide mi contrasena" con correo (este proyecto no tiene
+        servicio de correo configurado), es el equivalente administrativo:
+        alguien de confianza la restablece directamente.
+        """
+        usuario = self.get_object()
+        password = (request.data.get('password') or '').strip()
+        if len(password) < 8:
+            return Response(
+                {'status': 'error', 'mensaje': 'La contraseña debe tener al menos 8 caracteres.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        usuario.set_password(password)
+        usuario.save(update_fields=['password'])
+        # Invalida cualquier sesion anterior: quien tuviera el token viejo
+        # (por ejemplo, alguien que ya no deberia tener acceso a esa cuenta)
+        # no puede seguir usandolo despues de un cambio de contrasena.
+        Token.objects.filter(user=usuario).delete()
+        return Response({'status': 'success'})
+
+
+class RolViewSet(viewsets.ModelViewSet):
+    """CRUD de `auth_group`, usados como roles: un rol es un conjunto de permisos."""
+    queryset = Group.objects.all().order_by('name')
+    serializer_class = RolSerializer
+    permission_classes = [IsAuthenticated, EsSuperusuario]
+
+    def get_queryset(self):
+        return super().get_queryset().annotate(total_usuarios=Count('user', distinct=True))
+
+
+class PermisoViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Catalogo de permisos disponibles, para construir la matriz de la
+    pantalla de roles. Solo lectura: el catalogo se define en
+    `RecursoSistema.Meta.permissions` (codigo), no desde la UI.
+    """
+    serializer_class = PermisoSerializer
+    permission_classes = [IsAuthenticated, EsSuperusuario]
+
+    def get_queryset(self):
+        return Permission.objects.filter(
+            content_type__app_label='credencializacion',
+            content_type__model='recursosistema',
+        ).order_by('codename')

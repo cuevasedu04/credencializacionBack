@@ -678,6 +678,34 @@ def ruta_relativa_desde_url(valor) -> str | None:
     return ruta
 
 
+def hash_contenido(ruta_relativa) -> str | None:
+    """SHA-256 del contenido de un archivo de MEDIA_ROOT, o None si no existe."""
+    if not ruta_relativa:
+        return None
+    ruta = _media_root() / str(ruta_relativa)
+    if not ruta.is_file():
+        return None
+    try:
+        return hashlib.sha256(ruta.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def hash_desde_ruta(ruta_archivada) -> str | None:
+    """
+    Hash que ya lleva en el nombre un archivo del historico
+    (`historico/aa/<hash>.ext`), sin volver a leerlo del disco.
+
+    Comparar dos archivados, o un archivado contra el hash de un archivo vivo,
+    equivale a comparar su contenido byte a byte -- pero sin costo de E/S.
+    """
+    if not ruta_archivada:
+        return None
+    nombre = str(ruta_archivada).rsplit('/', 1)[-1]
+    base = nombre.rsplit('.', 1)[0]
+    return base if len(base) == 64 else None
+
+
 def archivar_medio(ruta_relativa) -> str | None:
     """
     Copia un archivo de MEDIA_ROOT al archivo historico y regresa su nueva

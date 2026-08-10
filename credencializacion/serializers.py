@@ -1,12 +1,17 @@
 from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group, Permission
 from rest_framework import serializers
 from .models import (
     Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
     EnrolamientoCredencial, PlantillaCredencial, UnidadAdministrativa,
+    PerfilUsuario,
 )
 from . import media_utils
 import base64
 import binascii
+
+Usuario = get_user_model()
 
 
 def detectar_tipo_imagen(data):
@@ -228,7 +233,12 @@ class EnrolamientoCredencialSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = EnrolamientoCredencial
-        fields = '__all__'
+        # Los lienzos quedan FUERA a proposito. El viewset los difiere para no
+        # reventar el buffer de ordenamiento de MySQL (pesan ~47 KB por fila);
+        # si el serializer los pidiera, Django los cargaria uno por uno al
+        # serializar y cada fila del listado costaria una consulta extra a la
+        # BD remota. Quien necesite el lienzo usa `auditoria-detalle`.
+        exclude = ('canvas_frente', 'canvas_reverso')
 
 
 class PlantillaCredencialSerializer(serializers.ModelSerializer):
@@ -268,3 +278,133 @@ class UnidadAdministrativaSerializer(serializers.ModelSerializer):
     def get_total_empleados(self, obj):
         # Lo inyecta la vista para no disparar una consulta por fila.
         return getattr(obj, 'total_empleados', None)
+
+
+# ==========================================================================
+# Administracion: usuarios y roles (auth_user / auth_group / auth_permission,
+# ninguna tabla propia -- ver credencializacion/auth.py)
+# ==========================================================================
+
+class PermisoSerializer(serializers.ModelSerializer):
+    """
+    Un permiso del catalogo (`RecursoSistema.Meta.permissions`). Solo lectura:
+    el catalogo se define en codigo, no se edita desde la pantalla -- lo que
+    SI se edita ahi es que roles lo tienen asignado.
+    """
+    class Meta:
+        model = Permission
+        fields = ['id', 'codename', 'name']
+
+
+class RolSerializer(serializers.ModelSerializer):
+    """
+    Un rol es un `auth_group` con un subconjunto de permisos del catalogo.
+
+    `permisos` acepta y regresa CODENAMES (`'ver_plantillas'`), no ids: es lo
+    que ya usa el frontend para decidir que mostrar, asi que evita una vuelta
+    extra resolviendo ids <-> nombres en cada pantalla.
+    """
+    permisos = serializers.ListField(child=serializers.CharField(), write_only=True, required=False)
+    permisos_detalle = PermisoSerializer(source='permissions', many=True, read_only=True)
+    total_usuarios = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Group
+        fields = ['id', 'name', 'permisos', 'permisos_detalle', 'total_usuarios']
+
+    def get_total_usuarios(self, obj):
+        return getattr(obj, 'total_usuarios', None)
+
+    def _permisos_del_catalogo(self, codenames):
+        return Permission.objects.filter(
+            content_type__app_label='credencializacion',
+            content_type__model='recursosistema',
+            codename__in=codenames or [],
+        )
+
+    def create(self, validated_data):
+        codenames = validated_data.pop('permisos', [])
+        grupo = Group.objects.create(**validated_data)
+        grupo.permissions.set(self._permisos_del_catalogo(codenames))
+        return grupo
+
+    def update(self, instance, validated_data):
+        codenames = validated_data.pop('permisos', None)
+        instance.name = validated_data.get('name', instance.name)
+        instance.save()
+        # None = el cliente no mando el campo (p.ej. solo renombrando el rol);
+        # [] SI debe vaciar los permisos -- son casos distintos.
+        if codenames is not None:
+            instance.permissions.set(self._permisos_del_catalogo(codenames))
+        return instance
+
+
+class UsuarioSerializer(serializers.ModelSerializer):
+    """
+    CRUD de `auth_user` para la pantalla de administracion.
+
+    La contrasena NUNCA se expone ni se acepta aqui -- tiene su propio action
+    (`set-password` en `UsuarioViewSet`) para que quede claro en la API que
+    cambiarla es una operacion distinta, deliberada, no un campo mas de un
+    formulario de edicion general.
+    """
+    roles = serializers.PrimaryKeyRelatedField(source='groups', many=True, queryset=Group.objects.all(), required=False)
+    roles_detalle = serializers.SerializerMethodField()
+    # num_empleado/foto no viven en auth_user (ver PerfilUsuario) -- se leen
+    # con SerializerMethodField y se escriben "a mano" desde initial_data en
+    # create()/update(), mismo patron que ya usa `password` aqui abajo: no
+    # son columnas del modelo que este serializer expone, asi que declararlos
+    # como campos normales (con `source=`) no los haria escribibles solos.
+    num_empleado = serializers.SerializerMethodField()
+    foto = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Usuario
+        fields = [
+            'id', 'username', 'email', 'first_name', 'last_name',
+            'is_active', 'is_superuser', 'is_staff', 'date_joined',
+            'last_login', 'roles', 'roles_detalle', 'num_empleado', 'foto',
+        ]
+        read_only_fields = ['date_joined', 'last_login']
+
+    def get_roles_detalle(self, obj):
+        return [{'id': g.id, 'name': g.name} for g in obj.groups.all()]
+
+    def get_num_empleado(self, obj):
+        # getattr con default funciona aunque no exista el PerfilUsuario:
+        # Django hace que RelatedObjectDoesNotExist herede de AttributeError
+        # exactamente para que este patron sea seguro.
+        return getattr(getattr(obj, 'perfil', None), 'num_empleado', '') or ''
+
+    def get_foto(self, obj):
+        num_empleado = self.get_num_empleado(obj)
+        if not num_empleado:
+            return None
+        ruta = media_utils.resolver_foto(num_empleado)
+        return media_utils.url_publica(ruta) if ruta else None
+
+    def _guardar_num_empleado(self, usuario):
+        if 'num_empleado' not in self.initial_data:
+            return
+        num_empleado = (self.initial_data.get('num_empleado') or '').strip()
+        PerfilUsuario.objects.update_or_create(
+            usuario=usuario, defaults={'num_empleado': num_empleado},
+        )
+
+    def create(self, validated_data):
+        roles = validated_data.pop('groups', [])
+        password = self.initial_data.get('password')
+        usuario = Usuario(**validated_data)
+        # Sin contrasena usable: nadie podria iniciar sesion con esta cuenta
+        # hasta que el superusuario le fije una desde `set-password`. Mejor
+        # eso que aceptar un valor implicito o vacio como contrasena real.
+        usuario.set_password(password or Usuario.objects.make_random_password())
+        usuario.save()
+        usuario.groups.set(roles)
+        self._guardar_num_empleado(usuario)
+        return usuario
+
+    def update(self, instance, validated_data):
+        usuario = super().update(instance, validated_data)
+        self._guardar_num_empleado(usuario)
+        return usuario

@@ -121,6 +121,35 @@ DATABASES = {
 }
 
 
+# DRF: se habilita autenticacion real (antes no habia NINGUN bloque
+# REST_FRAMEWORK, asi que todo caia en el default AllowAny sin autenticar a
+# nadie -- ver CLAUDE.md, gotcha #3).
+#
+# `DEFAULT_PERMISSION_CLASSES` se queda en AllowAny A PROPOSITO: cerrar todos
+# los endpoints de golpe romperia produccion, hay ~40 vistas que hoy asumen
+# que no hace falta sesion. Lo que cambia es que `request.user` ahora SI se
+# resuelve cuando llega un token valido, lo que permite: (a) sellar quien
+# hizo cada accion en las columnas de auditoria (id_usuario_registra /
+# id_usuario_modifica), y (b) exigir `IsAuthenticated` / permisos concretos
+# en las vistas NUEVAS (administracion de usuarios y roles) sin tocar las
+# demas. Cerrar el resto de los endpoints, uno por uno, queda como trabajo
+# aparte y deliberado, no un efecto colateral de este cambio.
+#
+# BearerTokenAuthentication (no el TokenAuthentication de DRF a secas): el
+# frontend ya manda `Authorization: Bearer <token>` (TokenInterceptor), y el
+# prefijo que DRF reconoce por omision es `Token`. Se adapta el backend en
+# vez de tocar el interceptor, que corre en cada peticion del sistema.
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'credencializacion.auth.BearerTokenAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+}
+
+
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
 
