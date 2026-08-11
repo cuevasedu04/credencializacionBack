@@ -3630,7 +3630,13 @@ class PlantillaCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
     # credenciales" en cada seleccion) se queda abierto. Solo DISEÑAR una
     # plantilla -- crearla, editarla, borrarla o cambiar cual es la que se usa
     # por omision -- exige `plantillas_administrar`.
-    _ACCIONES_ADMINISTRAR = {'create', 'update', 'partial_update', 'destroy', 'marcar_por_defecto'}
+    _ACCIONES_ADMINISTRAR = {
+        'create', 'update', 'partial_update', 'destroy', 'marcar_por_defecto',
+        # Subir/borrar fondos no estaba en este conjunto -- quedaba abierto
+        # (AllowAny) igual que list/retrieve, cuando administrar los fondos
+        # es la misma operacion de diseño que el resto de este conjunto.
+        'subir_fondo', 'borrar_fondo',
+    }
 
     def get_permissions(self):
         if self.action in self._ACCIONES_ADMINISTRAR:
@@ -3747,6 +3753,53 @@ class PlantillaCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
                     })
 
         return Response({'status': 'success', 'fondos': archivos})
+
+    @action(detail=False, methods=['post'], url_path='borrar-fondo')
+    def borrar_fondo(self, request):
+        """
+        Borra un fondo de MEDIA_ROOT/plantillas/.
+
+        Antes de esto no habia forma de quitar un fondo ya subido -- el
+        editor solo permitia agregarlos. Se niega el borrado si ALGUNA
+        plantilla (activa o no) todavia lo usa como fondo_frente/fondo_reverso:
+        borrarlo de todas formas dejaria esa plantilla apuntando a un archivo
+        inexistente, y el editor/preview la mostraria con el fondo en blanco
+        sin ninguna pista de por que.
+        """
+        ruta = (request.data.get('ruta') or '').strip()
+        if not ruta:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar la ruta del fondo.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Solo se puede borrar dentro de la carpeta de fondos -- sin esto,
+        # una ruta como '../../settings.py' se resolveria fuera de MEDIA_ROOT.
+        prefijo = f'{settings.MEDIA_DIR_PLANTILLAS}/'
+        nombre_archivo = ruta[len(prefijo):] if ruta.startswith(prefijo) else ruta
+        if not ruta.startswith(prefijo) or '/' in nombre_archivo or '..' in nombre_archivo:
+            return Response(
+                {'status': 'error', 'mensaje': 'Ruta de fondo invalida.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        en_uso = PlantillaCredencial.objects.filter(
+            Q(fondo_frente=ruta) | Q(fondo_reverso=ruta)
+        ).values_list('nombre', flat=True)
+        if en_uso:
+            return Response({
+                'status': 'error',
+                'mensaje': f'No se puede borrar: lo usan estas plantillas: {", ".join(en_uso)}.',
+            }, status=status.HTTP_409_CONFLICT)
+
+        borrado = media_utils.borrar(ruta)
+        if not borrado:
+            return Response(
+                {'status': 'error', 'mensaje': 'No se encontro ese fondo en el servidor.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response({'status': 'success'})
 
     @action(detail=True, methods=['post'], url_path='duplicar')
     def duplicar(self, request, pk=None):

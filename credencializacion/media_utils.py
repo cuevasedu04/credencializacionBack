@@ -563,12 +563,19 @@ def guardar_fondo_plantilla(contenido_base64: str, nombre_archivo: str) -> str:
         raise MediaError('El fondo recibido esta vacio.')
 
     directorio = _media_root() / carpeta_plantillas()
-    directorio.mkdir(parents=True, exist_ok=True)
 
-    ext = detectar_extension(contenido)
-    destino = directorio / f'{base}.{ext}'
-    with open(destino, 'wb') as archivo:
-        archivo.write(contenido)
+    try:
+        directorio.mkdir(parents=True, exist_ok=True)
+        ext = detectar_extension(contenido)
+        destino = directorio / f'{base}.{ext}'
+        with open(destino, 'wb') as archivo:
+            archivo.write(contenido)
+    except OSError as exc:
+        # Permisos del usuario con el que corre gunicorn en el servidor,
+        # disco lleno, etc. -- sin esto, esto tumbaba la vista con un 500
+        # crudo (traceback de Django) en vez de un error legible que el
+        # frontend ya sabe mostrar (MediaError -> 400 con 'mensaje').
+        raise MediaError(f'No se pudo guardar el fondo en el servidor: {exc}') from exc
 
     return f'{carpeta_plantillas()}/{base}.{ext}'
 

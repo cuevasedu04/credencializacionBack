@@ -197,6 +197,19 @@ MEDIA_DIR_FOTOS = 'fotos'
 MEDIA_DIR_FIRMAS = 'FIRMAS'
 MEDIA_DIR_PLANTILLAS = 'plantillas'
 
+# Los fondos de plantilla (subir-fondo, PlantillaCredencialViewSet) viajan
+# como base64 dentro del cuerpo JSON, no como multipart -- eso los infla
+# ~33% y los hace pasar por el limite de Django para el body completo
+# (DATA_UPLOAD_MAX_MEMORY_SIZE), no por FILE_UPLOAD_MAX_MEMORY_SIZE. El
+# default de Django es 2.5 MB: una foto de prueba chica pasa sin problema,
+# pero un fondo de credencial real (arte a resolucion de impresion) lo
+# rebasa seguido -- de ahi las fallas intermitentes solo en produccion con
+# imagenes de verdad, nunca en pruebas locales con archivos pequeños. Se
+# suben ambos limites para dejar margen: 20 MB de archivo crudo ya cubre
+# holgadamente el ~33% de inflado del base64.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
+
 # Configuración CORS
 if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
