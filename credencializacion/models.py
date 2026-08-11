@@ -117,6 +117,56 @@ class EnrolamientoCredencial(models.Model):
         return media_utils.url_publica(ruta) if ruta else None
 
 
+class AcuseCredencial(models.Model):
+    """
+    Registro de auditoria de acuses de alta/baja cargados para un empleado --
+    UNA FILA POR CARGA, igual que EnrolamientoCredencial es una fila por
+    impresion. NO es la tabla de EnrolamientoCredencial a proposito: esa
+    tiene una invariante fuerte ("una fila = una impresion", con folio,
+    vigencia y lienzo obligatorios para ese evento) que un acuse no encaja
+    -- no hay folio ni PDF generado al subir un acuse, y forzar esos campos
+    a null en cada carga ensuciaria el historial de impresiones del que ya
+    depende /auditoria-credenciales.
+
+    El archivo en si NO se referencia aqui por ruta: vive en MEDIA_ROOT
+    nombrado por convencion (`acuse_alta/<num_empleado>.<ext>` /
+    `acuse_baja/<num_empleado>.<ext>`, ver media_utils.guardar_acuse) y se
+    resuelve en el momento, igual que foto/firma. Cada carga SOBREESCRIBE el
+    archivo vigente (no hay necesidad de conservar versiones previas del
+    documento como si fuera una credencial impresa); esta tabla solo audita
+    quien lo subio y cuando.
+    """
+    TIPO_ALTA = 'alta'
+    TIPO_BAJA = 'baja'
+    TIPOS = [(TIPO_ALTA, 'Acuse de alta'), (TIPO_BAJA, 'Acuse de baja')]
+
+    id_acuse = models.AutoField(primary_key=True)
+    num_empleado = models.CharField(max_length=20, db_index=True)
+    tipo = models.CharField(max_length=10, choices=TIPOS)
+
+    fecha_carga = models.DateTimeField(auto_now_add=True)
+    id_usuario_carga = models.IntegerField(blank=True, null=True)
+
+    class Meta:
+        managed = True
+        db_table = 'sicre_tbl_acuse_credencial'
+        ordering = ['-fecha_carga']
+        verbose_name = 'Acuse de credencial'
+        verbose_name_plural = 'Acuses de credencial'
+
+    def __str__(self):
+        return f'{self.num_empleado} - {self.get_tipo_display()}'
+
+    @property
+    def archivo_url(self):
+        ruta = (
+            media_utils.resolver_acuse_alta(self.num_empleado)
+            if self.tipo == self.TIPO_ALTA
+            else media_utils.resolver_acuse_baja(self.num_empleado)
+        )
+        return media_utils.url_publica(ruta) if ruta else None
+
+
 class PlantillaCredencial(models.Model):
     """
     Plantilla de credencial disenada en el editor tipo canvas.
@@ -509,6 +559,7 @@ CODENAMES_CATALOGO_PERMISOS = [
     ('ver_inventario_medios', 'Ver: Inventario de medios'),
     ('ver_catalogo_areas', 'Ver: Catálogo de áreas'),
     ('ver_auditoria_credenciales', 'Ver: Auditoría de credenciales'),
+    ('ver_acuses', 'Ver: Acuses de alta/baja'),
 
     # ---- Funcionalidades dentro de una pantalla ----
     ('plantillas_administrar', 'Plantillas: crear, editar, eliminar y marcar por defecto'),

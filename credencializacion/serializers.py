@@ -5,7 +5,7 @@ from rest_framework import serializers
 from .models import (
     Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
     EnrolamientoCredencial, PlantillaCredencial, UnidadAdministrativa,
-    PerfilUsuario,
+    PerfilUsuario, AcuseCredencial,
 )
 from . import media_utils
 import base64
@@ -239,6 +239,19 @@ class EnrolamientoCredencialSerializer(serializers.ModelSerializer):
         # serializar y cada fila del listado costaria una consulta extra a la
         # BD remota. Quien necesite el lienzo usa `auditoria-detalle`.
         exclude = ('canvas_frente', 'canvas_reverso')
+
+
+class AcuseCredencialSerializer(serializers.ModelSerializer):
+    """
+    Fila de auditoria de UNA carga de acuse. El archivo no se guarda como
+    columna -- se resuelve por convencion de nombre (ver AcuseCredencial.archivo_url),
+    igual que foto_url/firma_url en EnrolamientoCredencialSerializer.
+    """
+    archivo = serializers.CharField(source='archivo_url', read_only=True)
+
+    class Meta:
+        model = AcuseCredencial
+        fields = ['id_acuse', 'num_empleado', 'tipo', 'archivo', 'fecha_carga', 'id_usuario_carga']
 
 
 class PlantillaCredencialSerializer(serializers.ModelSerializer):

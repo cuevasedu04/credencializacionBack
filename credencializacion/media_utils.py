@@ -30,7 +30,15 @@ _FIRMAS_BINARIAS = [
     (b'GIF87a', 'gif'),
     (b'GIF89a', 'gif'),
     (b'BM', 'bmp'),
+    (b'%PDF-', 'pdf'),
 ]
+
+# Los acuses se aceptan como PDF o imagen (foto del documento firmado). A
+# diferencia de EXTENSIONES_FOTO/EXTENSIONES_FIRMA, el orden aqui no importa
+# para resolver_existente porque solo puede haber UN acuse vigente por
+# empleado/tipo (guardar_imagen borra cualquier variante previa antes de
+# escribir la nueva, sea cual sea su extension).
+EXTENSIONES_ACUSE = ['pdf', 'jpg', 'JPG', 'jpeg', 'JPEG', 'png', 'PNG', 'webp', 'bmp']
 
 _RE_DATA_URI = re.compile(r'^data:(?P<mime>[\w/\-\.\+]+);base64,(?P<datos>.*)$', re.DOTALL)
 # num_empleado se usa como nombre de archivo: solo permitimos caracteres seguros.
@@ -55,6 +63,14 @@ def carpeta_firmas() -> str:
 
 def carpeta_plantillas() -> str:
     return settings.MEDIA_DIR_PLANTILLAS
+
+
+def carpeta_acuse_alta() -> str:
+    return settings.MEDIA_DIR_ACUSE_ALTA
+
+
+def carpeta_acuse_baja() -> str:
+    return settings.MEDIA_DIR_ACUSE_BAJA
 
 
 def nombre_seguro(valor) -> str:
@@ -116,6 +132,14 @@ def resolver_foto(identificador) -> str | None:
 
 def resolver_firma(identificador) -> str | None:
     return resolver_existente(identificador, carpeta_firmas(), EXTENSIONES_FIRMA)
+
+
+def resolver_acuse_alta(identificador) -> str | None:
+    return resolver_existente(identificador, carpeta_acuse_alta(), EXTENSIONES_ACUSE)
+
+
+def resolver_acuse_baja(identificador) -> str | None:
+    return resolver_existente(identificador, carpeta_acuse_baja(), EXTENSIONES_ACUSE)
 
 
 # Los primeros 10 caracteres del RFC y del CURP de una misma persona son
@@ -397,6 +421,21 @@ def guardar_firma(contenido_base64: str, identificador) -> str:
     )
 
 
+def guardar_acuse(contenido_base64: str, identificador, tipo: str) -> str:
+    """
+    Guarda un acuse (PDF o imagen del documento firmado) RESPETANDO su
+    formato de origen -- a diferencia de la firma, aqui no hace falta canal
+    alfa ni ningun otro tratamiento, es un documento tal cual se escaneo o
+    fotografio. `tipo` debe ser 'alta' o 'baja'; cualquier otro valor es un
+    error de programacion, no de datos del usuario.
+    """
+    if tipo not in ('alta', 'baja'):
+        raise MediaError(f"Tipo de acuse invalido: '{tipo}' (debe ser 'alta' o 'baja').")
+
+    carpeta = carpeta_acuse_alta() if tipo == 'alta' else carpeta_acuse_baja()
+    return guardar_imagen(contenido_base64, identificador, carpeta, EXTENSIONES_ACUSE)
+
+
 # RFC de persona fisica: 4 letras + 6 digitos (AAMMDD) + 3 de homoclave.
 # La homoclave con frecuencia no se captura, de ahi que sea opcional.
 _RE_RFC = re.compile(r'^[A-ZÑ&]{4}[0-9]{6}([A-Z0-9]{3})?$', re.IGNORECASE)
@@ -475,6 +514,42 @@ def listar_medios_por_identificador(solo_numericos: bool) -> dict:
                 modificado = None
             if modificado and (item['fecha'] is None or modificado > item['fecha']):
                 item['fecha'] = modificado
+
+    return registros
+
+
+def listar_acuses() -> dict:
+    """
+    Recorre acuse_alta/ y acuse_baja/ y arma {num_empleado: {'alta': url|None,
+    'baja': url|None}}, para poblar de un jalon la columna de acuses de TODO
+    el roster en la ag-Grid de "Acuses" (mismo patron que
+    listar_medios_por_identificador para fotos/firmas).
+
+    A diferencia de foto/firma, no hay distincion numerico/no-numerico: un
+    acuse solo se sube por num_empleado (siempre numerico), nunca por RFC --
+    no existe el equivalente a "enrolamiento previo" para acuses.
+    """
+    registros: dict = {}
+    validas = {e.lower() for e in EXTENSIONES_ACUSE}
+
+    for carpeta, clave in ((carpeta_acuse_alta(), 'alta'), (carpeta_acuse_baja(), 'baja')):
+        directorio = _media_root() / carpeta
+        if not directorio.is_dir():
+            continue
+        try:
+            entradas = list(os.scandir(directorio))
+        except OSError:
+            continue
+
+        for entrada in entradas:
+            if not entrada.is_file():
+                continue
+            base, _, ext = entrada.name.rpartition('.')
+            if not base or ext.lower() not in validas:
+                continue
+
+            item = registros.setdefault(base, {'alta': None, 'baja': None})
+            item[clave] = url_publica(f'{carpeta}/{entrada.name}', versionada=True)
 
     return registros
 

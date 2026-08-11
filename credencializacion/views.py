@@ -6,13 +6,14 @@ from rest_framework.pagination import PageNumberPagination
 from .models import (
     Enrolamiento, SicreTblSig, EnrolamientoFamiliar, CargaMasiva,
     EnrolamientoCredencial, PlantillaCredencial, ConsecutivoFolio,
-    UnidadAdministrativa, CODENAMES_CATALOGO_PERMISOS,
+    UnidadAdministrativa, CODENAMES_CATALOGO_PERMISOS, AcuseCredencial,
 )
 from .serializers import (
     EnrolamientoSerializer, SigSerializer, EnrolamientoDataTableSerializer,
     ArchivoExcelSerializer, LoginSerializer, EnrolamientoFamiliarSerializer,
     CargaMasivaSerializer, EnrolamientoCredencialSerializer, PlantillaCredencialSerializer,
     UnidadAdministrativaSerializer, UsuarioSerializer, RolSerializer, PermisoSerializer,
+    AcuseCredencialSerializer,
 )
 from .auth import EsSuperusuario, tiene_permiso
 from . import media_utils
@@ -3619,6 +3620,108 @@ class EnrolamientoCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet
     # El action 'marcar-impreso' se elimino junto con la columna `impreso`:
     # ahora cada fila de la tabla ES una impresion, asi que no hay nada que
     # marcar. Ver registrar-impresion.
+
+
+class AcuseCredencialViewSet(viewsets.ViewSet):
+    """
+    Acuses de alta/baja (PDF o imagen del documento firmado), cargados desde
+    la pantalla "Acuses".
+
+    Deliberadamente NO es un ModelViewSet: exponer create/update/destroy
+    genericos sobre AcuseCredencial permitiria crear una fila de auditoria
+    sin el archivo correspondiente (o viceversa). Solo hay tres operaciones
+    validas -- ver `subir`, `mapa`, `por_empleado` -- y todas pasan por
+    media_utils para que archivo y fila de auditoria se mantengan juntos.
+
+    El archivo se guarda por convencion de nombre (acuse_alta/<num_empleado>.ext
+    / acuse_baja/<num_empleado>.ext, ver media_utils.guardar_acuse) y CADA
+    carga lo sobreescribe -- a diferencia de EnrolamientoCredencial no hay
+    necesidad de conservar versiones anteriores del documento, esta tabla
+    solo audita quien lo subio y cuando (ver docstring del modelo).
+    """
+
+    @action(detail=False, methods=['get'], url_path='mapa')
+    def mapa(self, request):
+        """
+        {num_empleado: {'alta': url|null, 'baja': url|null}} para TODO lo que
+        hay en disco, en una sola llamada -- igual que el roster de "Imprimir
+        credenciales" (GET .../empleados-sig/todos/), para que la ag-Grid de
+        "Acuses" pueda mostrar el estado de las ~16 mil filas sin disparar una
+        peticion por empleado.
+        """
+        return Response({'status': 'success', 'registros': media_utils.listar_acuses()})
+
+    @action(detail=False, methods=['post'], url_path='subir')
+    def subir(self, request):
+        """
+        Guarda el archivo (base64, PDF o imagen) y dejar registro de quien lo
+        subio y cuando. Abierto a cualquier usuario autenticado con acceso a
+        la pantalla (gating por `ver_acuses` en el frontend/ruta) -- es
+        captura operativa del dia a dia, no una operacion administrativa,
+        igual que `guardar-medios-empleado`.
+        """
+        num_empleado = (request.data.get('num_empleado') or '').strip()
+        tipo = (request.data.get('tipo') or '').strip()
+        archivo = request.data.get('archivo')
+
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if tipo not in (AcuseCredencial.TIPO_ALTA, AcuseCredencial.TIPO_BAJA):
+            return Response(
+                {'status': 'error', 'mensaje': "El tipo debe ser 'alta' o 'baja'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not archivo:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar el archivo.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            media_utils.guardar_acuse(archivo, num_empleado, tipo)
+        except media_utils.MediaError as exc:
+            return Response(
+                {'status': 'error', 'mensaje': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registro = AcuseCredencial.objects.create(
+            num_empleado=num_empleado,
+            tipo=tipo,
+            id_usuario_carga=_usuario_actual_id(request),
+        )
+
+        return Response(
+            {
+                'status': 'success',
+                'id_acuse': registro.id_acuse,
+                'num_empleado': num_empleado,
+                'tipo': tipo,
+                'archivo': registro.archivo_url,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=['get'], url_path='por-empleado')
+    def por_empleado(self, request):
+        """Historial de cargas (alta y baja) de un empleado, mas reciente primero."""
+        num_empleado = (request.query_params.get('num_empleado') or '').strip()
+        if not num_empleado:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar num_empleado.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        registros = AcuseCredencial.objects.filter(num_empleado=num_empleado)
+        return Response({
+            'status': 'success',
+            'resultados': AcuseCredencialSerializer(registros, many=True).data,
+        })
+
+
 class PlantillaCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet):
     """CRUD de plantillas disenadas en el editor tipo canvas (Fabric.js)."""
     queryset = PlantillaCredencial.objects.all()

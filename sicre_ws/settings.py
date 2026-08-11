@@ -196,6 +196,8 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 MEDIA_DIR_FOTOS = 'fotos'
 MEDIA_DIR_FIRMAS = 'FIRMAS'
 MEDIA_DIR_PLANTILLAS = 'plantillas'
+MEDIA_DIR_ACUSE_ALTA = 'acuse_alta'
+MEDIA_DIR_ACUSE_BAJA = 'acuse_baja'
 
 # Los fondos de plantilla (subir-fondo, PlantillaCredencialViewSet) viajan
 # como base64 dentro del cuerpo JSON, no como multipart -- eso los infla
