@@ -2677,6 +2677,19 @@ class EnrolamientoCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet
         if hasta:
             registros = registros.filter(fecha_registro__date__lte=hasta)
 
+        registros = list(registros)
+
+        # Quien imprimio/modifico cada fila se guarda como IntegerField suelto
+        # (id_usuario_registra/id_usuario_modifica), no como FK -- ver
+        # AuditoriaUsuarioMixin. Se resuelve a nombre de usuario en UNA sola
+        # consulta para todo el listado, no una por fila.
+        ids_usuario = {r.id_usuario_registra for r in registros if r.id_usuario_registra}
+        ids_usuario |= {r.id_usuario_modifica for r in registros if r.id_usuario_modifica}
+        usuarios_por_id = {
+            u.id: (u.get_full_name().strip() or u.username)
+            for u in Usuario.objects.filter(id__in=ids_usuario)
+        } if ids_usuario else {}
+
         filas = []
         for r in registros:
             empleado = empleados.get((r.num_empleado or '').strip()) or {}
@@ -2697,6 +2710,9 @@ class EnrolamientoCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet
                 'plantilla_credencial': r.plantilla_credencial,
                 'con_ajustes': bool(r.con_ajustes),
                 'fecha_registro': r.fecha_registro,
+                'usuario_registra': usuarios_por_id.get(r.id_usuario_registra) or '',
+                'fecha_modificacion': r.fecha_modificacion,
+                'usuario_modifica': usuarios_por_id.get(r.id_usuario_modifica) or '',
             })
 
         return Response({
