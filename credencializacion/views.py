@@ -21,7 +21,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.db.models import Q, Count, Min
-from django.db import models, transaction, connection
+from django.db import models, transaction, connection, IntegrityError
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
@@ -3688,17 +3688,32 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # update_or_create, NUNCA create() a secas: el modelo es una fila por
+        # get_or_create, NUNCA create() a secas: el modelo es una fila por
         # (num_empleado, tipo) -- ver docstring de AcuseCredencial. La primera
         # carga sella fecha_carga/id_usuario_carga (via el default); cualquier
         # carga posterior para la misma llave es un REEMPLAZO y sella
         # fecha_modificacion/id_usuario_modifica en su lugar, dejando intacto
         # quien lo subio la primera vez.
-        registro, creado = AcuseCredencial.objects.get_or_create(
-            num_empleado=num_empleado,
-            tipo=tipo,
-            defaults={'id_usuario_carga': _usuario_actual_id(request)},
-        )
+        #
+        # get_or_create YA reintenta el get() una vez si el create() choca con
+        # la restriccion UNIQUE (carrera entre dos peticiones casi
+        # simultaneas) -- pero se vio en produccion que ese reintento no
+        # siempre basta (IntegrityError sin capturar, con la fila ya
+        # existiendo). Se envuelve aqui para que, si aun asi truena, se
+        # recupere con un get() propio en vez de tumbar la peticion con un
+        # 500: el archivo YA se guardo en disco arriba, perder el registro de
+        # auditoria por una carrera de milisegundos seria peor que una
+        # consulta extra.
+        try:
+            registro, creado = AcuseCredencial.objects.get_or_create(
+                num_empleado=num_empleado,
+                tipo=tipo,
+                defaults={'id_usuario_carga': _usuario_actual_id(request)},
+            )
+        except IntegrityError:
+            registro = AcuseCredencial.objects.get(num_empleado=num_empleado, tipo=tipo)
+            creado = False
+
         if not creado:
             registro.fecha_modificacion = timezone.now()
             registro.id_usuario_modifica = _usuario_actual_id(request)
