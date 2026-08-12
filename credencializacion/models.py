@@ -119,22 +119,28 @@ class EnrolamientoCredencial(models.Model):
 
 class AcuseCredencial(models.Model):
     """
-    Registro de auditoria de acuses de alta/baja cargados para un empleado --
-    UNA FILA POR CARGA, igual que EnrolamientoCredencial es una fila por
-    impresion. NO es la tabla de EnrolamientoCredencial a proposito: esa
-    tiene una invariante fuerte ("una fila = una impresion", con folio,
-    vigencia y lienzo obligatorios para ese evento) que un acuse no encaja
-    -- no hay folio ni PDF generado al subir un acuse, y forzar esos campos
-    a null en cada carga ensuciaria el historial de impresiones del que ya
-    depende /auditoria-credenciales.
+    Registro de auditoria del acuse de alta/baja vigente de un empleado --
+    UNA FILA POR (num_empleado, tipo), no una fila por carga: a diferencia de
+    EnrolamientoCredencial (una fila por impresion, historial completo), aqui
+    solo interesa saber quien subio el acuse la PRIMERA vez
+    (fecha_carga/id_usuario_carga) y quien lo REEMPLAZO por ultima vez
+    (fecha_modificacion/id_usuario_modifica) -- no cada version intermedia.
+    `subir` (ver AcuseCredencialViewSet) hace update_or_create sobre esa
+    llave, nunca create() a secas.
+
+    NO es la tabla de EnrolamientoCredencial a proposito: esa tiene una
+    invariante fuerte ("una fila = una impresion", con folio, vigencia y
+    lienzo obligatorios para ese evento) que un acuse no encaja -- no hay
+    folio ni PDF generado al subir un acuse, y forzar esos campos a null en
+    cada carga ensuciaria el historial de impresiones del que ya depende
+    /auditoria-credenciales.
 
     El archivo en si NO se referencia aqui por ruta: vive en MEDIA_ROOT
     nombrado por convencion (`acuse_alta/<num_empleado>.<ext>` /
     `acuse_baja/<num_empleado>.<ext>`, ver media_utils.guardar_acuse) y se
     resuelve en el momento, igual que foto/firma. Cada carga SOBREESCRIBE el
-    archivo vigente (no hay necesidad de conservar versiones previas del
-    documento como si fuera una credencial impresa); esta tabla solo audita
-    quien lo subio y cuando.
+    archivo vigente en disco -- no hay necesidad de conservar versiones
+    previas del documento como si fuera una credencial impresa.
     """
     TIPO_ALTA = 'alta'
     TIPO_BAJA = 'baja'
@@ -146,10 +152,16 @@ class AcuseCredencial(models.Model):
 
     fecha_carga = models.DateTimeField(auto_now_add=True)
     id_usuario_carga = models.IntegerField(blank=True, null=True)
+    # Se quedan vacios mientras el acuse nunca se ha reemplazado -- distinguir
+    # "nunca se toco" de "se reemplazo el mismo dia que se cargo" importa para
+    # la pantalla de Auditoria.
+    fecha_modificacion = models.DateTimeField(blank=True, null=True)
+    id_usuario_modifica = models.IntegerField(blank=True, null=True)
 
     class Meta:
         managed = True
         db_table = 'sicre_tbl_acuse_credencial'
+        unique_together = [('num_empleado', 'tipo')]
         ordering = ['-fecha_carga']
         verbose_name = 'Acuse de credencial'
         verbose_name_plural = 'Acuses de credencial'

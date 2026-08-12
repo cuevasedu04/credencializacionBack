@@ -3688,11 +3688,21 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        registro = AcuseCredencial.objects.create(
+        # update_or_create, NUNCA create() a secas: el modelo es una fila por
+        # (num_empleado, tipo) -- ver docstring de AcuseCredencial. La primera
+        # carga sella fecha_carga/id_usuario_carga (via el default); cualquier
+        # carga posterior para la misma llave es un REEMPLAZO y sella
+        # fecha_modificacion/id_usuario_modifica en su lugar, dejando intacto
+        # quien lo subio la primera vez.
+        registro, creado = AcuseCredencial.objects.get_or_create(
             num_empleado=num_empleado,
             tipo=tipo,
-            id_usuario_carga=_usuario_actual_id(request),
+            defaults={'id_usuario_carga': _usuario_actual_id(request)},
         )
+        if not creado:
+            registro.fecha_modificacion = timezone.now()
+            registro.id_usuario_modifica = _usuario_actual_id(request)
+            registro.save(update_fields=['fecha_modificacion', 'id_usuario_modifica'])
 
         return Response(
             {
@@ -3707,7 +3717,7 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='por-empleado')
     def por_empleado(self, request):
-        """Historial de cargas (alta y baja) de un empleado, mas reciente primero."""
+        """Estado de acuses (alta y baja) de un empleado."""
         num_empleado = (request.query_params.get('num_empleado') or '').strip()
         if not num_empleado:
             return Response(
@@ -3719,6 +3729,61 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
         return Response({
             'status': 'success',
             'resultados': AcuseCredencialSerializer(registros, many=True).data,
+        })
+
+    @action(detail=False, methods=['get'], url_path='auditoria')
+    def auditoria(self, request):
+        """
+        Historial completo de acuses, para la pestaña "Auditoría" de la
+        pantalla "Acuses": quien subio cada acuse y, si se reemplazo despues,
+        quien y cuando.
+
+        Los nombres (empleado y usuarios) se resuelven en dos consultas
+        adicionales, no una por fila -- igual criterio que
+        EnrolamientoCredencialViewSet.auditoria(). No hace falta el cache de
+        roster de esa clase: aqui como maximo hay dos filas por empleado
+        (alta y baja), muy por debajo de las ~16 mil del roster completo.
+        """
+        registros = list(AcuseCredencial.objects.all().order_by('-fecha_carga'))
+
+        nums_empleado = {r.num_empleado for r in registros if r.num_empleado}
+        empleados = {
+            e['no_empleado']: e
+            for e in SicreTblSig.objects.filter(no_empleado__in=nums_empleado)
+            .values('no_empleado', 'nombres', 'primer_apellido', 'segundo_apellido')
+        } if nums_empleado else {}
+
+        ids_usuario = {r.id_usuario_carga for r in registros if r.id_usuario_carga}
+        ids_usuario |= {r.id_usuario_modifica for r in registros if r.id_usuario_modifica}
+        usuarios_por_id = {
+            u.id: (u.get_full_name().strip() or u.username)
+            for u in Usuario.objects.filter(id__in=ids_usuario)
+        } if ids_usuario else {}
+
+        filas = []
+        for r in registros:
+            empleado = empleados.get((r.num_empleado or '').strip()) or {}
+            nombre = ' '.join(filter(None, [
+                (empleado.get('nombres') or '').strip(),
+                (empleado.get('primer_apellido') or '').strip(),
+                (empleado.get('segundo_apellido') or '').strip(),
+            ]))
+            filas.append({
+                'id_acuse': r.id_acuse,
+                'num_empleado': r.num_empleado,
+                'nombre': nombre,
+                'tipo': r.tipo,
+                'archivo': r.archivo_url,
+                'fecha_carga': r.fecha_carga,
+                'usuario_carga': usuarios_por_id.get(r.id_usuario_carga) or '',
+                'fecha_modificacion': r.fecha_modificacion,
+                'usuario_modifica': usuarios_por_id.get(r.id_usuario_modifica) or '',
+            })
+
+        return Response({
+            'status': 'success',
+            'total': len(filas),
+            'resultados': filas,
         })
 
 
