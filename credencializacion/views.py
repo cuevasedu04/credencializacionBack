@@ -20,7 +20,7 @@ from . import media_utils
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
-from django.db.models import Q, Count, Min
+from django.db.models import Q, Count, Min, Max
 from django.db import models, transaction, connection, IntegrityError
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
@@ -1477,6 +1477,20 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
     }
 
     REQUIRED_COLUMNS = list(COLUMN_ALIASES.keys())
+
+    @action(detail=False, methods=['get'], url_path='ultima-actualizacion')
+    def ultima_actualizacion(self, request):
+        """
+        Solo la fecha de sincronizacion mas reciente del roster (un MAX()),
+        SIN traer las ~16 mil filas -- para el badge del header, que debe
+        conocerla en cuanto se entra al sistema (login), no solo cuando
+        alguien visita "Imprimir credenciales" y paga el costo del dataset
+        completo (ver `todos`, mismo criterio: el sync de Celery escribe el
+        mismo valor en todas las filas de un lote, se toma el maximo por si
+        alguna vez quedara una sincronizacion parcial).
+        """
+        maxima = SicreTblSig.objects.aggregate(maxima=Max('fecha_actualizacion'))['maxima']
+        return Response({'status': 'success', 'fecha_actualizacion': maxima})
 
     @action(detail=False, methods=['get'], url_path='todos')
     def todos(self, request):
