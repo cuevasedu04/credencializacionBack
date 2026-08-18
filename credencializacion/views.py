@@ -27,6 +27,7 @@ from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
 import pandas as pd
+import requests
 import base64
 import os
 import time
@@ -1451,6 +1452,14 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = SigSerializer
     pagination_class = SigPagination
 
+    def get_permissions(self):
+        # Unica accion de este viewset que exige sesion: dispara un trabajo
+        # en OTRO sistema (Control_De_Plazas_Backend), asi que no se deja tan
+        # abierta como el resto (lectura del roster, todo AllowAny).
+        if self.action == 'forzar_actualizacion':
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     filter_backends = [filters.SearchFilter]
     search_fields = [
         'empleado_anam', 'no_empleado', 'curp', 'nombres',
@@ -1491,6 +1500,60 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
         """
         maxima = SicreTblSig.objects.aggregate(maxima=Max('fecha_actualizacion'))['maxima']
         return Response({'status': 'success', 'fecha_actualizacion': maxima})
+
+    @action(detail=False, methods=['post'], url_path='forzar-actualizacion')
+    def forzar_actualizacion(self, request):
+        """
+        Dispara manualmente la sincronizacion del roster (boton "Actualizar"
+        del header) -- proxy hacia Control_De_Plazas_Backend, que es quien
+        realmente encola la tarea de Celery `importar_poblado_credenciales`.
+
+        Se hace desde AQUI, servidor a servidor, y no directo desde el
+        navegador: ese trigger exige un token de SERVICIO
+        (POBLADO_CREDENCIALES_TRIGGER_TOKEN), no la sesion del usuario.
+        Mandarlo al frontend lo dejaria expuesto en el bundle/devtools de
+        cualquiera que abriera la pantalla. Aqui vive solo en el .env del
+        servidor.
+
+        El otro lado NO espera a que la tarea termine (regresa `task_id` de
+        inmediato); el frontend detecta que ya termino sondeando
+        `ultima-actualizacion` con el intervalo acelerado (ver
+        RosterSyncService.activarSondeoRapido en el front) hasta que la fecha
+        cambie, no por ninguna respuesta de este endpoint.
+        """
+        url = settings.POBLADO_CREDENCIALES_TRIGGER_URL
+        token = settings.POBLADO_CREDENCIALES_TRIGGER_TOKEN
+        if not url or not token:
+            return Response(
+                {
+                    'status': 'error',
+                    'mensaje': 'La actualización manual no está configurada en el servidor '
+                               '(faltan POBLADO_CREDENCIALES_TRIGGER_URL / _TOKEN en el .env).',
+                },
+                status=status.HTTP_501_NOT_IMPLEMENTED,
+            )
+
+        try:
+            respuesta = requests.post(
+                url, headers={'Authorization': f'Token {token}'}, timeout=10,
+            )
+            respuesta.raise_for_status()
+        except requests.RequestException as exc:
+            return Response(
+                {
+                    'status': 'error',
+                    'mensaje': f'No se pudo contactar el servicio de actualización: {exc}',
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        datos = {}
+        try:
+            datos = respuesta.json()
+        except ValueError:
+            pass
+
+        return Response({'status': 'success', 'task_id': datos.get('task_id')})
 
     @action(detail=False, methods=['get'], url_path='todos')
     def todos(self, request):
