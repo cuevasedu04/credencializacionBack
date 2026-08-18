@@ -221,15 +221,6 @@ else:
         'http://168.231.73.222,https://168.231.73.222,http://localhost:5555'
     ).split(',')
 
-# Disparo manual de la sincronizacion del roster SIG (boton "Actualizar" del
-# header). El endpoint real vive en OTRO servicio (Control_De_Plazas_Backend,
-# tarea de Celery `importar_poblado_credenciales`) y exige un token de
-# SERVICIO -- nunca se manda al frontend: el navegador solo habla con ESTE
-# backend, que hace la llamada servidor-a-servidor. Vacio por omision: sin
-# configurar, el boton responde con un error claro en vez de fallar feo.
-POBLADO_CREDENCIALES_TRIGGER_URL = os.environ.get('POBLADO_CREDENCIALES_TRIGGER_URL', '')
-POBLADO_CREDENCIALES_TRIGGER_TOKEN = os.environ.get('POBLADO_CREDENCIALES_TRIGGER_TOKEN', '')
-
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

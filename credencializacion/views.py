@@ -27,7 +27,6 @@ from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
 import pandas as pd
-import requests
 import base64
 import os
 import time
@@ -1453,9 +1452,10 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = SigPagination
 
     def get_permissions(self):
-        # Unica accion de este viewset que exige sesion: dispara un trabajo
-        # en OTRO sistema (Control_De_Plazas_Backend), asi que no se deja tan
-        # abierta como el resto (lectura del roster, todo AllowAny).
+        # Unica accion de este viewset que exige sesion: inserta una
+        # solicitud que Control_De_Plazas_Backend recoge y ejecuta, asi que
+        # no se deja tan abierta como el resto (lectura del roster, todo
+        # AllowAny).
         if self.action == 'forzar_actualizacion':
             return [IsAuthenticated()]
         return super().get_permissions()
@@ -1505,55 +1505,38 @@ class SigViewSet(viewsets.ReadOnlyModelViewSet):
     def forzar_actualizacion(self, request):
         """
         Dispara manualmente la sincronizacion del roster (boton "Actualizar"
-        del header) -- proxy hacia Control_De_Plazas_Backend, que es quien
-        realmente encola la tarea de Celery `importar_poblado_credenciales`.
+        del header). Control_De_Plazas_Backend (el proceso de Celery que
+        corre la tarea `importar_poblado_credenciales`) vive SIEMPRE en una
+        PC Windows local (necesita Edge/Selenium para el SIG) y no expone
+        -- ni va a exponer -- un endpoint HTTP: en vez de eso, revisa cada
+        30 s la tabla EjeCentral.plantilla_solicitudpobladocredenciales
+        (mismo servidor MySQL que sicre_db) y corre la tarea el solo cuando
+        encuentra una fila sin atender. Aqui basta con insertar la solicitud.
 
-        Se hace desde AQUI, servidor a servidor, y no directo desde el
-        navegador: ese trigger exige un token de SERVICIO
-        (POBLADO_CREDENCIALES_TRIGGER_TOKEN), no la sesion del usuario.
-        Mandarlo al frontend lo dejaria expuesto en el bundle/devtools de
-        cualquiera que abriera la pantalla. Aqui vive solo en el .env del
-        servidor.
-
-        El otro lado NO espera a que la tarea termine (regresa `task_id` de
-        inmediato); el frontend detecta que ya termino sondeando
+        El frontend detecta que la tarea ya termino sondeando
         `ultima-actualizacion` con el intervalo acelerado (ver
-        RosterSyncService.activarSondeoRapido en el front) hasta que la fecha
-        cambie, no por ninguna respuesta de este endpoint.
+        RosterSyncService.activarSondeoRapido) hasta que la fecha cambie, no
+        por ninguna respuesta de este endpoint.
         """
-        url = settings.POBLADO_CREDENCIALES_TRIGGER_URL
-        token = settings.POBLADO_CREDENCIALES_TRIGGER_TOKEN
-        if not url or not token:
-            return Response(
-                {
-                    'status': 'error',
-                    'mensaje': 'La actualización manual no está configurada en el servidor '
-                               '(faltan POBLADO_CREDENCIALES_TRIGGER_URL / _TOKEN en el .env).',
-                },
-                status=status.HTTP_501_NOT_IMPLEMENTED,
-            )
-
         try:
-            respuesta = requests.post(
-                url, headers={'Authorization': f'Token {token}'}, timeout=10,
-            )
-            respuesta.raise_for_status()
-        except requests.RequestException as exc:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO EjeCentral.plantilla_solicitudpobladocredenciales
+                        (creado_en, atendido)
+                    VALUES (NOW(6), 0)
+                    """
+                )
+        except Exception as exc:
             return Response(
                 {
                     'status': 'error',
-                    'mensaje': f'No se pudo contactar el servicio de actualización: {exc}',
+                    'mensaje': f'No se pudo registrar la solicitud de actualización: {exc}',
                 },
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        datos = {}
-        try:
-            datos = respuesta.json()
-        except ValueError:
-            pass
-
-        return Response({'status': 'success', 'task_id': datos.get('task_id')})
+        return Response({'status': 'success'})
 
     @action(detail=False, methods=['get'], url_path='todos')
     def todos(self, request):
