@@ -252,7 +252,7 @@ class AcuseCredencialSerializer(serializers.ModelSerializer):
     class Meta:
         model = AcuseCredencial
         fields = [
-            'id_acuse', 'num_empleado', 'tipo', 'archivo',
+            'id_acuse', 'num_empleado', 'tipo', 'numero', 'archivo',
             'fecha_carga', 'id_usuario_carga',
             'fecha_modificacion', 'id_usuario_modifica',
         ]

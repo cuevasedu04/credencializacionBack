@@ -21,7 +21,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.db.models import Q, Count, Min, Max
-from django.db import models, transaction, connection, IntegrityError
+from django.db import models, transaction, connection
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
@@ -3685,40 +3685,50 @@ class EnrolamientoCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet
 class AcuseCredencialViewSet(viewsets.ViewSet):
     """
     Acuses de alta/baja (PDF o imagen del documento firmado), cargados desde
-    la pantalla "Acuses".
+    la pantalla "Acuses" -- hasta AcuseCredencial.MAX_POR_EMPLEADO (10) por
+    empleado y tipo, porque un empleado puede tener varios movimientos de
+    alta o de baja a lo largo del tiempo.
 
     Deliberadamente NO es un ModelViewSet: exponer create/update/destroy
     genericos sobre AcuseCredencial permitiria crear una fila de auditoria
-    sin el archivo correspondiente (o viceversa). Solo hay tres operaciones
-    validas -- ver `subir`, `mapa`, `por_empleado` -- y todas pasan por
-    media_utils para que archivo y fila de auditoria se mantengan juntos.
-
-    El archivo se guarda por convencion de nombre (acuse_alta/<num_empleado>.ext
-    / acuse_baja/<num_empleado>.ext, ver media_utils.guardar_acuse) y CADA
-    carga lo sobreescribe -- a diferencia de EnrolamientoCredencial no hay
-    necesidad de conservar versiones anteriores del documento, esta tabla
-    solo audita quien lo subio y cuando (ver docstring del modelo).
+    sin el archivo correspondiente (o viceversa). Las operaciones validas son
+    `subir`, `eliminar`, `mapa`, `por_empleado`, `auditoria` -- todas pasan
+    por media_utils para que archivo y fila de base de datos se mantengan
+    juntos.
     """
 
     @action(detail=False, methods=['get'], url_path='mapa')
     def mapa(self, request):
         """
-        {num_empleado: {'alta': url|null, 'baja': url|null}} para TODO lo que
-        hay en disco, en una sola llamada -- igual que el roster de "Imprimir
-        credenciales" (GET .../empleados-sig/todos/), para que la ag-Grid de
-        "Acuses" pueda mostrar el estado de las ~16 mil filas sin disparar una
-        peticion por empleado.
+        {num_empleado: {'alta': N, 'baja': N}} -- cuantos acuses de cada tipo
+        tiene YA cada empleado, para pintar la columna "n/10" de la ag-Grid
+        de "Acuses" sin disparar una peticion por fila. Se cuenta desde la
+        BASE DE DATOS (ya no escaneando el disco como antes de soportar
+        varios acuses por empleado): cada fila de AcuseCredencial es un
+        archivo real -- ver `subir` -- asi que la tabla es la fuente de
+        verdad de cuantos hay, y contar filas es mas barato que listar
+        directorios con miles de archivos.
         """
-        return Response({'status': 'success', 'registros': media_utils.listar_acuses()})
+        conteos: dict[str, dict[str, int]] = {}
+        agregados = (
+            AcuseCredencial.objects.values('num_empleado', 'tipo')
+            .annotate(n=Count('id_acuse'))
+        )
+        for fila in agregados:
+            registro = conteos.setdefault(fila['num_empleado'], {'alta': 0, 'baja': 0})
+            registro[fila['tipo']] = fila['n']
+        return Response({'status': 'success', 'registros': conteos})
 
     @action(detail=False, methods=['post'], url_path='subir')
     def subir(self, request):
         """
-        Guarda el archivo (base64, PDF o imagen) y dejar registro de quien lo
-        subio y cuando. Abierto a cualquier usuario autenticado con acceso a
-        la pantalla (gating por `ver_acuses` en el frontend/ruta) -- es
-        captura operativa del dia a dia, no una operacion administrativa,
-        igual que `guardar-medios-empleado`.
+        Guarda el archivo (base64, PDF o imagen) como un acuse NUEVO -- nunca
+        reemplaza uno existente, a diferencia del diseno original: ahora un
+        empleado puede acumular hasta MAX_POR_EMPLEADO acuses del mismo tipo.
+        Abierto a cualquier usuario autenticado con acceso a la pantalla
+        (gating por `ver_acuses` en el frontend/ruta) -- es captura operativa
+        del dia a dia, no una operacion administrativa, igual que
+        `guardar-medios-empleado`.
         """
         num_empleado = (request.data.get('num_empleado') or '').strip()
         tipo = (request.data.get('tipo') or '').strip()
@@ -3740,44 +3750,40 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            media_utils.guardar_acuse(archivo, num_empleado, tipo)
-        except media_utils.MediaError as exc:
-            return Response(
-                {'status': 'error', 'mensaje': str(exc)},
-                status=status.HTTP_400_BAD_REQUEST,
+        # select_for_update() dentro de la transaccion bloquea las filas
+        # existentes de este empleado+tipo mientras se decide el proximo
+        # numero libre, igual que folio_consumir con ConsecutivoFolio -- sin
+        # esto, dos cargas casi simultaneas podrian calcular el mismo hueco y
+        # chocar contra la restriccion UNIQUE (num_empleado, tipo, numero).
+        with transaction.atomic():
+            existentes = set(
+                AcuseCredencial.objects.select_for_update()
+                .filter(num_empleado=num_empleado, tipo=tipo)
+                .values_list('numero', flat=True)
             )
+            if len(existentes) >= AcuseCredencial.MAX_POR_EMPLEADO:
+                return Response(
+                    {
+                        'status': 'error',
+                        'mensaje': f'Ya se cargaron {AcuseCredencial.MAX_POR_EMPLEADO} acuses de '
+                                   f'{tipo} para este empleado. Elimina alguno antes de subir otro.',
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            numero = next(n for n in range(1, AcuseCredencial.MAX_POR_EMPLEADO + 1) if n not in existentes)
 
-        # get_or_create, NUNCA create() a secas: el modelo es una fila por
-        # (num_empleado, tipo) -- ver docstring de AcuseCredencial. La primera
-        # carga sella fecha_carga/id_usuario_carga (via el default); cualquier
-        # carga posterior para la misma llave es un REEMPLAZO y sella
-        # fecha_modificacion/id_usuario_modifica en su lugar, dejando intacto
-        # quien lo subio la primera vez.
-        #
-        # get_or_create YA reintenta el get() una vez si el create() choca con
-        # la restriccion UNIQUE (carrera entre dos peticiones casi
-        # simultaneas) -- pero se vio en produccion que ese reintento no
-        # siempre basta (IntegrityError sin capturar, con la fila ya
-        # existiendo). Se envuelve aqui para que, si aun asi truena, se
-        # recupere con un get() propio en vez de tumbar la peticion con un
-        # 500: el archivo YA se guardo en disco arriba, perder el registro de
-        # auditoria por una carrera de milisegundos seria peor que una
-        # consulta extra.
-        try:
-            registro, creado = AcuseCredencial.objects.get_or_create(
-                num_empleado=num_empleado,
-                tipo=tipo,
-                defaults={'id_usuario_carga': _usuario_actual_id(request)},
+            try:
+                media_utils.guardar_acuse(archivo, num_empleado, tipo, numero)
+            except media_utils.MediaError as exc:
+                return Response(
+                    {'status': 'error', 'mensaje': str(exc)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            registro = AcuseCredencial.objects.create(
+                num_empleado=num_empleado, tipo=tipo, numero=numero,
+                id_usuario_carga=_usuario_actual_id(request),
             )
-        except IntegrityError:
-            registro = AcuseCredencial.objects.get(num_empleado=num_empleado, tipo=tipo)
-            creado = False
-
-        if not creado:
-            registro.fecha_modificacion = timezone.now()
-            registro.id_usuario_modifica = _usuario_actual_id(request)
-            registro.save(update_fields=['fecha_modificacion', 'id_usuario_modifica'])
 
         return Response(
             {
@@ -3785,14 +3791,46 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
                 'id_acuse': registro.id_acuse,
                 'num_empleado': num_empleado,
                 'tipo': tipo,
+                'numero': numero,
                 'archivo': registro.archivo_url,
             },
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=False, methods=['post'], url_path='eliminar')
+    def eliminar(self, request):
+        """
+        Borra UN acuse (archivo + fila) por `id_acuse`. Deja libre su
+        `numero` para la proxima carga de ese empleado+tipo -- `subir`
+        siempre busca el primer hueco disponible, no el final de la lista.
+        """
+        id_acuse = request.data.get('id_acuse')
+        if not id_acuse:
+            return Response(
+                {'status': 'error', 'mensaje': 'Debe indicar id_acuse.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            registro = AcuseCredencial.objects.get(id_acuse=id_acuse)
+        except AcuseCredencial.DoesNotExist:
+            return Response(
+                {'status': 'error', 'mensaje': 'Ese acuse ya no existe.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        media_utils.borrar_acuse(registro.num_empleado, registro.tipo, registro.numero)
+        registro.delete()
+
+        return Response({'status': 'success'})
+
     @action(detail=False, methods=['get'], url_path='por-empleado')
     def por_empleado(self, request):
-        """Estado de acuses (alta y baja) de un empleado."""
+        """
+        Acuses de un empleado -- de alta y baja por omision, o solo un tipo
+        si se manda `tipo` (usado por el modal de gestion, que solo necesita
+        la lista de UN tipo a la vez).
+        """
         num_empleado = (request.query_params.get('num_empleado') or '').strip()
         if not num_empleado:
             return Response(
@@ -3801,6 +3839,10 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
             )
 
         registros = AcuseCredencial.objects.filter(num_empleado=num_empleado)
+        tipo = (request.query_params.get('tipo') or '').strip()
+        if tipo:
+            registros = registros.filter(tipo=tipo)
+
         return Response({
             'status': 'success',
             'resultados': AcuseCredencialSerializer(registros, many=True).data,
@@ -3816,8 +3858,9 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
         Los nombres (empleado y usuarios) se resuelven en dos consultas
         adicionales, no una por fila -- igual criterio que
         EnrolamientoCredencialViewSet.auditoria(). No hace falta el cache de
-        roster de esa clase: aqui como maximo hay dos filas por empleado
-        (alta y baja), muy por debajo de las ~16 mil del roster completo.
+        roster de esa clase: aqui como maximo hay 20 filas por empleado
+        (hasta 10 de alta y 10 de baja, ver AcuseCredencial.MAX_POR_EMPLEADO),
+        muy por debajo de las ~16 mil del roster completo.
         """
         registros = list(AcuseCredencial.objects.all().order_by('-fecha_carga'))
 
@@ -3848,6 +3891,7 @@ class AcuseCredencialViewSet(viewsets.ViewSet):
                 'num_empleado': r.num_empleado,
                 'nombre': nombre,
                 'tipo': r.tipo,
+                'numero': r.numero,
                 'archivo': r.archivo_url,
                 'fecha_carga': r.fecha_carga,
                 'usuario_carga': usuarios_por_id.get(r.id_usuario_carga) or '',

@@ -119,29 +119,39 @@ class EnrolamientoCredencial(models.Model):
 
 class AcuseCredencial(models.Model):
     """
-    Registro de auditoria del acuse de alta/baja vigente de un empleado --
-    UNA FILA POR (num_empleado, tipo), no una fila por carga: a diferencia de
-    EnrolamientoCredencial (una fila por impresion, historial completo), aqui
-    solo interesa saber quien subio el acuse la PRIMERA vez
-    (fecha_carga/id_usuario_carga) y quien lo REEMPLAZO por ultima vez
-    (fecha_modificacion/id_usuario_modifica) -- no cada version intermedia.
-    `subir` (ver AcuseCredencialViewSet) hace update_or_create sobre esa
-    llave, nunca create() a secas.
+    Registro de auditoria de UN acuse de alta/baja de un empleado -- UNA FILA
+    POR CARGA, hasta MAX_POR_EMPLEADO (10) por (num_empleado, tipo): un
+    empleado puede tener varios acuses de alta o de baja a lo largo del
+    tiempo (movimientos administrativos repetidos), y a diferencia del diseno
+    original (una sola fila por num_empleado+tipo, cada carga SOBREESCRIBIA
+    la anterior) ahora cada carga es un archivo independiente que convive con
+    los demas. `numero` (1..10) es la llave de archivo dentro de esa pareja
+    num_empleado+tipo -- ver `subir` en AcuseCredencialViewSet, que busca el
+    primer hueco libre en vez de siempre create() al final, asi que borrar un
+    acuse intermedio deja ese numero disponible para la proxima carga.
+
+    `fecha_modificacion`/`id_usuario_modifica` son un remanente del diseno
+    anterior (donde una carga podia "reemplazar" a la vigente in-place): ya
+    no se escriben desde `subir` -- ahora reemplazar significa borrar la fila
+    vieja y crear una nueva -- pero se dejan en el modelo sin migracion de
+    baja para no perder esa informacion en filas creadas antes de este
+    cambio.
 
     NO es la tabla de EnrolamientoCredencial a proposito: esa tiene una
     invariante fuerte ("una fila = una impresion", con folio, vigencia y
     lienzo obligatorios para ese evento) que un acuse no encaja -- no hay
-    folio ni PDF generado al subir un acuse, y forzar esos campos a null en
-    cada carga ensuciaria el historial de impresiones del que ya depende
-    /auditoria-credenciales.
+    folio ni PDF generado al subir un acuse.
 
     El archivo en si NO se referencia aqui por ruta: vive en MEDIA_ROOT
-    nombrado por convencion (`acuse_alta/<num_empleado>.<ext>` /
-    `acuse_baja/<num_empleado>.<ext>`, ver media_utils.guardar_acuse) y se
-    resuelve en el momento, igual que foto/firma. Cada carga SOBREESCRIBE el
-    archivo vigente en disco -- no hay necesidad de conservar versiones
-    previas del documento como si fuera una credencial impresa.
+    nombrado por convencion (`acuse_alta/<num_empleado>_<numero>.<ext>` /
+    `acuse_baja/<num_empleado>_<numero>.<ext>`, ver media_utils.guardar_acuse)
+    y se resuelve en el momento, igual que foto/firma. `numero=1` tambien
+    prueba el nombre SIN sufijo (`<num_empleado>.<ext>`) al resolver, para
+    los acuses cargados antes de este cambio -- no hizo falta una migracion
+    que renombrara archivos en disco.
     """
+    MAX_POR_EMPLEADO = 10
+
     TIPO_ALTA = 'alta'
     TIPO_BAJA = 'baja'
     TIPOS = [(TIPO_ALTA, 'Acuse de alta'), (TIPO_BAJA, 'Acuse de baja')]
@@ -149,33 +159,29 @@ class AcuseCredencial(models.Model):
     id_acuse = models.AutoField(primary_key=True)
     num_empleado = models.CharField(max_length=20, db_index=True)
     tipo = models.CharField(max_length=10, choices=TIPOS)
+    numero = models.PositiveSmallIntegerField(default=1)
 
     fecha_carga = models.DateTimeField(auto_now_add=True)
     id_usuario_carga = models.IntegerField(blank=True, null=True)
-    # Se quedan vacios mientras el acuse nunca se ha reemplazado -- distinguir
-    # "nunca se toco" de "se reemplazo el mismo dia que se cargo" importa para
-    # la pantalla de Auditoria.
+    # Remanente del diseno anterior -- ver docstring de la clase.
     fecha_modificacion = models.DateTimeField(blank=True, null=True)
     id_usuario_modifica = models.IntegerField(blank=True, null=True)
 
     class Meta:
         managed = True
         db_table = 'sicre_tbl_acuse_credencial'
-        unique_together = [('num_empleado', 'tipo')]
-        ordering = ['-fecha_carga']
+        unique_together = [('num_empleado', 'tipo', 'numero')]
+        ordering = ['num_empleado', 'tipo', 'numero']
         verbose_name = 'Acuse de credencial'
         verbose_name_plural = 'Acuses de credencial'
 
     def __str__(self):
-        return f'{self.num_empleado} - {self.get_tipo_display()}'
+        return f'{self.num_empleado} - {self.get_tipo_display()} #{self.numero}'
 
     @property
     def archivo_url(self):
-        ruta = (
-            media_utils.resolver_acuse_alta(self.num_empleado)
-            if self.tipo == self.TIPO_ALTA
-            else media_utils.resolver_acuse_baja(self.num_empleado)
-        )
+        carpeta = media_utils.carpeta_acuse_alta() if self.tipo == self.TIPO_ALTA else media_utils.carpeta_acuse_baja()
+        ruta = media_utils.resolver_acuse(self.num_empleado, carpeta, self.numero)
         return media_utils.url_publica(ruta) if ruta else None
 
 
