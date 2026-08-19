@@ -2411,7 +2411,7 @@ class EnrolamientoCredencialPagination(PageNumberPagination):
     max_page_size = 500
 
 
-def _congelar_snapshot(canvas_json, medios=None):
+def _congelar_snapshot(canvas_json, medios=None, num_empleado=None, curp=None):
     """
     Deja un lienzo de Fabric listo para archivarse como constancia de lo
     impreso: cada imagen que apunta a MEDIA_ROOT se copia al archivo historico
@@ -2434,6 +2434,16 @@ def _congelar_snapshot(canvas_json, medios=None):
     Si se pasa un diccionario en `medios`, se anota ahi que archivo quedo como
     foto, firma y fondo. El rol solo se puede saber AQUI, por la carpeta de
     origen: una vez archivado, el nombre es un hash y ya no dice nada.
+
+    `num_empleado`/`curp` son el respaldo para cuando el `src` que trae el
+    lienzo ya no existe en disco -- pasa al reimprimir reutilizando los
+    ajustes de una impresion vieja (ver poblarDatos() en el front: a
+    proposito NO vuelve a resolver una imagen ya puesta, para no perder un
+    recorte manual), si entre esa impresion y esta la foto/firma paso de
+    estar nombrada por CURP a estar nombrada por num_empleado. Sin este
+    respaldo, `archivar_medio` fallaria en silencio y la URL vieja (rota)
+    quedaria grabada para siempre en el snapshot -- la auditoria nunca mas
+    podria mostrar esa credencial.
     """
     if not isinstance(canvas_json, dict):
         return None
@@ -2443,6 +2453,10 @@ def _congelar_snapshot(canvas_json, medios=None):
         media_utils.carpeta_firmas(): 'firma',
         media_utils.carpeta_plantillas(): 'fondo',
     }
+    resolver_por_rol = {
+        'foto': (media_utils.carpeta_fotos(), media_utils.EXTENSIONES_FOTO),
+        'firma': (media_utils.carpeta_firmas(), media_utils.EXTENSIONES_FIRMA),
+    }
 
     def archivar_nodo(nodo):
         if not isinstance(nodo, dict):
@@ -2451,19 +2465,30 @@ def _congelar_snapshot(canvas_json, medios=None):
         src = nodo.get('src')
         if isinstance(src, str) and src:
             relativa = media_utils.ruta_relativa_desde_url(src)
+            rol = carpetas.get(str(relativa).split('/', 1)[0]) if relativa else None
             archivada = media_utils.archivar_medio(relativa) if relativa else None
+
+            # El src que trae el lienzo ya no existe: puede ser una foto/firma
+            # que se cruzo (paso de CURP a num_empleado) despues de la
+            # impresion original de la que se copiaron estos ajustes.
+            # Reintentar por los identificadores ACTUALES antes de rendirse.
+            if not archivada and rol in resolver_por_rol and (num_empleado or curp):
+                carpeta, extensiones = resolver_por_rol[rol]
+                ruta_actual, _origen = media_utils.resolver_con_respaldo(
+                    num_empleado, curp, carpeta, extensiones
+                )
+                archivada = media_utils.archivar_medio(ruta_actual) if ruta_actual else None
+
             if archivada:
                 # Sin `?v=`: la ruta ya identifica el contenido por su hash,
                 # asi que nunca cambia y puede cachearse para siempre.
                 nodo['src'] = media_utils.url_publica(archivada, versionada=False)
 
-                if medios is not None:
-                    rol = carpetas.get(str(relativa).split('/', 1)[0])
+                if medios is not None and rol:
                     # `setdefault`: si la misma cara trae dos imagenes de la
                     # misma carpeta, se conserva la primera en vez de que la
                     # ultima pise a la anterior.
-                    if rol:
-                        medios.setdefault(rol, archivada)
+                    medios.setdefault(rol, archivada)
 
         for hijo in (nodo.get('objects') or []):
             archivar_nodo(hijo)
@@ -2677,12 +2702,26 @@ class EnrolamientoCredencialViewSet(AuditoriaUsuarioMixin, viewsets.ModelViewSet
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # CURP como respaldo para _congelar_snapshot: si el lienzo trae un
+        # src que ya no existe (por ejemplo, foto/firma cruzada de CURP a
+        # num_empleado despues de la impresion de la que se copiaron los
+        # ajustes), permite reintentar resolviendola por los identificadores
+        # actuales antes de archivar una referencia rota.
+        curp = (
+            SicreTblSig.objects.filter(no_empleado=num_empleado)
+            .values_list('curp', flat=True).first()
+        )
+
         # Snapshot de AMBAS caras, siempre. Sus imagenes quedan archivadas en
         # media/historico/ para que nadie las pueda reemplazar despues, y de
         # paso se anota cual quedo como foto, firma y fondo.
         medios = {}
-        canvas_frente = _congelar_snapshot(request.data.get('canvas_frente'), medios)
-        canvas_reverso = _congelar_snapshot(request.data.get('canvas_reverso'), medios)
+        canvas_frente = _congelar_snapshot(
+            request.data.get('canvas_frente'), medios, num_empleado=num_empleado, curp=curp
+        )
+        canvas_reverso = _congelar_snapshot(
+            request.data.get('canvas_reverso'), medios, num_empleado=num_empleado, curp=curp
+        )
 
         registro = EnrolamientoCredencial.objects.create(
             num_empleado=num_empleado,
